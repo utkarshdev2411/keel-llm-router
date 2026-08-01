@@ -1,0 +1,12 @@
+# Obsidian
+.obsidian/
+
+# Local notes / planning folder
+Load-Balancer/
+
+# Rust
+/target/
+**/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
