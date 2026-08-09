@@ -67,6 +67,10 @@ def admits(state, b, kv_new):
 
 
 def choose_backend(backends, state, policy, kv_new):
+    if policy == "proxy":
+        # External router under test. It is the only endpoint; it picks the backend.
+        return backends[0]
+
     if policy == "least_conn":
         m = min(state["in_flight"].values())
         return random.choice([b for b, v in state["in_flight"].items() if v == m])
@@ -294,7 +298,8 @@ if __name__ == "__main__":
     ap.add_argument("--backends", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--policy", default="least_conn",
-                    choices=["least_conn", "kvts", "kvts_p2c", "pressure", "pressure_p2c"])
+                    choices=["least_conn", "kvts", "kvts_p2c", "pressure", "pressure_p2c",
+                             "proxy"])
     # must match the simulator's flags
     ap.add_argument("--max-num-seqs", type=int, default=8)
     ap.add_argument("--kv-capacity", type=int, default=8192)  # kv-cache-size 512 x block-size 16
