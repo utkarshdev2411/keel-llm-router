@@ -1,8 +1,35 @@
+# ---------------------------------------------------------------------------
+# PRIVATE. Research vault and design docs. Local only, never published.
+# NOTE: this previously read "Load-Balancer/", which stopped matching when the
+# folder was renamed to "Load-Balancer-Docs". The folder was unignored and
+# showing as untracked until 2026-08-09.
+# ---------------------------------------------------------------------------
+Load-Balancer-Docs/
+Load-Balancer/
+
 # Obsidian
 .obsidian/
 
-# Local notes / planning folder
-Load-Balancer/
+# ---------------------------------------------------------------------------
+# Generated data from phase0 runs. Nothing produced by a run belongs in version
+# control: traces rebuild from a seed, results rebuild from traces, and traces
+# are ~4.5 MB each. Committing results also publishes raw measurements.
+# ---------------------------------------------------------------------------
+*.json
+*.csv
+*.log
+results/
+results_*/
+*.png
+*.svg
+*.ipynb_checkpoints/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
 
 # Rust
 /target/
@@ -10,3 +37,9 @@ Load-Balancer/
 Cargo.lock
 **/*.rs.bk
 *.pdb
+
+# scratch
+tmp/
+scratch/
+
+# If you ever need to track a specific json/csv, force it: git add -f <file>
