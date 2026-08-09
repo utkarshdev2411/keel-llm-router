@@ -1,6 +1,6 @@
 ---
 tags: [journey, phase-0, validation]
-status: in-progress
+status: stage-0a-complete
 created: 2026-08-09
 ---
 
@@ -11,8 +11,8 @@ we are trying to solve actually occur, and can we measure it. If a standard load
 already spreads LLM traffic evenly, there is nothing worth building, and it is far cheaper
 to discover that in two days than in two months.
 
-This document records how Phase 0 was set up, what was measured, and where things currently
-stand.
+This document records how Phase 0 was set up, what was measured, and what came out of it.
+Stage 0a, the simulator half, is complete. Stage 0b against real hardware is not.
 
 ---
 
@@ -358,37 +358,124 @@ requests.
 
 ---
 
-## 8. Current status
+## 8. Does the algorithm fix it
 
-The problem is confirmed and its mechanism is measured. What has not yet been established
-is whether the proposed algorithm fixes it.
-
-The `pressure` policy tracks projected KV usage per backend, which is precisely the
-quantity found to be imbalanced. It therefore makes a falsifiable prediction: it should
-reduce the error rate at the same arrival rate on the same traffic. That comparison is the
-next run.
+The `pressure` policy tracks projected KV usage per backend, which is precisely the quantity
+found to be imbalanced. That gives it a falsifiable prediction to make: it should reduce the
+error rate at the same arrival rate on the same traffic. Three policies were run across three
+arrival rates on byte identical traces.
 
 ```bash
 ./stage5_compare.sh > compare.log 2>&1 &
-tail -f compare.log
 ```
 
-Three policies across three arrival rates, roughly twenty minutes. Interpretation rules for
-the result:
+### The result
 
-Error rate at the same rate is the whole test. If `pressure` does not reduce it, the
-mechanism does not work as theorised, and that is a real result worth having rather than
-something to explain away.
+| rate | least_conn | kvts | pressure | pressure vs baseline |
+|---|---|---|---|---|
+| 4 | 15.8% | 24.9% | 4.3% | 73% fewer errors |
+| 6 | 17.1% | 38.2% | 12.5% | 27% fewer errors |
+| 8 | 29.1% | 46.2% | 19.7% | 32% fewer errors |
 
-Latency should be ignored, since the simulator sheds rather than queues.
+`pressure` wins at every rate, in the same direction each time. On the full untrimmed run at
+rate 4 it completed 1436 of 1500 requests where `least_conn` completed 1283, which is 153
+more requests served from identical hardware on identical traffic.
 
-If `pressure` improves the error rate mainly by refusing to dispatch rather than by
-distributing better, that is a different and weaker claim than the one being made. The
-generator reports a `saturated_dispatches` counter which distinguishes the two.
+The improvement is also statistically solid, which matters because earlier attempts in this
+project chased p99 figures that rested on two samples. Error rate is a proportion measured
+over 1500 requests, so its confidence interval is tight:
 
-Once this lands, stage 0b repeats the same traces against real vLLM on a rented GPU, with
-`--kv-growth` enabled, to confirm the finding survives contact with real hardware. Only
-then does Phase 1 begin and the Rust implementation starts.
+```
+rate 4:  least_conn 15.8% +/- 1.9%     pressure 4.3% +/- 1.0%     (95% CI)
+```
+
+Those intervals are nowhere near overlapping. Unlike a tail latency percentile, this result
+holds from a single run.
+
+### The mechanism was confirmed, not just the outcome
+
+A win with no explanation is a win that cannot be trusted. The prediction was specifically
+that `pressure` would reduce the imbalance in prompt tokens, since that is what KV memory is
+allocated from. Measured directly:
+
+| rate | least_conn | kvts | pressure |
+|---|---|---|---|
+| 4 | 34.8% | 77.2% | 12.3% |
+| 6 | 18.7% | 71.3% | 10.7% |
+| 8 | 25.8% | 139.8% | 6.9% |
+
+The quantity predicted to improve improved, by roughly two thirds to three quarters, and the
+error rate fell in step with it. That is the difference between a fix and a coincidence.
+
+### It is not winning by shedding load
+
+This was the most important thing to rule out. A policy that refuses requests rather than
+distributing them better would show a lower error rate for the wrong reason, and rejected
+requests carry no latency measurement so it would also look artificially fast.
+
+Two checks rule it out. First, the arithmetic: every policy processed all 1500 requests, and
+successes plus errors summed to exactly 1500 in all nine runs. `pressure` did not serve fewer
+requests more successfully, it served the same requests with fewer failures.
+
+Second, the code path. The `saturated_dispatches` counter is nonzero for `pressure`, at 343,
+929 and 1113 across the three rates, which looks alarming until you check what happens next.
+When no backend passes the admission gate, the policy falls through to dispatching to the
+least bad option anyway. It never actually refuses. The counter records how often the gate
+found nothing clean, not how often a request was dropped.
+
+### kvts was decisively refuted
+
+The `kvts` policy, which ranks backends by total committed work in KV token seconds, performed
+worse than the baseline at every single rate. Its prompt token spread reached 139.8 percent at
+rate 8, meaning it made the imbalance substantially worse than doing nothing at all.
+
+The reason is structural rather than a tuning problem. The formula values one long request at
+roughly 256 times one short request, so a backend holding a single long generation is avoided
+almost entirely even when most of its capacity is free. Short requests then pile onto whichever
+backends happen to look clean, and those backends exhaust their memory. It manufactures
+scarcity by over avoiding.
+
+This is worth recording rather than deleting. It is a clean negative result, it explains why
+the corrected policy is shaped the way it is, and it remains in the code as an ablation arm.
+
+### One tradeoff to record honestly
+
+`pressure` has slightly worse tail latency at the two higher rates, 104 ms against 87 ms at
+rate 6 and 111 ms against 93 ms at rate 8. This is expected and it is the correct direction.
+Keeping more requests alive means more work in flight at any moment. A request that completes
+in 111 ms is better than one rejected at 93 ms.
+
+---
+
+## 9. Where stage 0a leaves things
+
+The problem is confirmed, its mechanism is measured, and the proposed fix is validated
+against that mechanism. What the algorithm does is mitigate rather than eliminate: at rate 8
+roughly one request in five still fails. The router makes the cliff arrive later and less
+steeply, it does not remove it. Past a certain load the answer is more capacity, and no
+routing policy changes that.
+
+Four gaps remain between this and a claim that would survive public scrutiny.
+
+These results come from a simulator whose failure mode is rejection, while real vLLM preempts
+and recomputes instead. Same trigger, different consequence, and whether the improvement
+transfers is untested.
+
+The simulator allocates KV memory from prompt length at admission. Real vLLM grows the
+allocation with every generated token. The `--kv-growth` flag exists for exactly this and has
+never been switched on against a real backend.
+
+The workload is a single shape: lognormal lengths, no prefix sharing, four backends. Real
+traffic contains shared system prompts, which changes KV behaviour substantially because
+blocks get deduplicated.
+
+The comparison is against least connections, which is what nginx and HAProxy do and what most
+deployments actually run. It is not a comparison against LLM aware routers such as llm-d,
+AIBrix or NVIDIA Dynamo, and those are what an informed reader will ask about.
+
+Stage 0b closes the largest of these. It repeats these same traces against real vLLM on a
+rented GPU with `--kv-growth` enabled, which costs an afternoon and a few dollars. Phase 1 and
+the Rust implementation begin after that.
 
 ---
 
