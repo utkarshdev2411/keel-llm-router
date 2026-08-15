@@ -356,9 +356,13 @@ if __name__ == "__main__":
                          "the same trace are not comparable (tracker B5).")
     ap.add_argument("--kv-capacity", type=int, default=8192)  # kv-cache-size 512 x block-size 16
     # scoring knobs
-    ap.add_argument("--theta", type=float, default=0.70)   # knee: penalty starts here
+    # Defaults are the VALIDATED values -- the ones that produced every published
+    # result. They previously read 0.70 / 0.90, which no reported run ever used, so
+    # anyone invoking this directly instead of through the stage scripts silently got
+    # untested parameters.
+    ap.add_argument("--theta", type=float, default=0.55)   # knee: penalty starts here
     ap.add_argument("--penalty", type=float, default=10.0) # convex weight above the knee
-    ap.add_argument("--sigma", type=float, default=0.90)   # admission ceiling
+    ap.add_argument("--sigma", type=float, default=0.95)   # admission ceiling
     ap.add_argument("--output-model", default="echo", choices=["echo", "max_tokens"],
                     help="how to predict a request's output length, which sets the KV "
                          "projection to prompt+output. 'echo' (default) matches "

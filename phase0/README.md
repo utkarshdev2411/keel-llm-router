@@ -323,9 +323,9 @@ Relevant tuning flags:
 |---|---|---|
 | `--max-num-seqs` | 32 | Must match the backend setting or the slot term is wrong |
 | `--kv-capacity` | 8192 | Must match `kv-cache-size` multiplied by `block-size` |
-| `--theta` | 0.70 | Occupancy at which the convex penalty begins |
+| `--theta` | 0.55 | Occupancy at which the convex penalty begins. Swept 0.35-0.70 with no measurable effect, so this is not the knob to reach for |
 | `--penalty` | 10.0 | Weight of the penalty above theta |
-| `--sigma` | 0.90 | Admission ceiling as a fraction of KV capacity |
+| `--sigma` | 0.95 | Admission ceiling as a fraction of KV capacity. This is the knob that matters |
 | `--kv-model` | `prompt_only` | Whether a request's KV grows as it generates. `prompt_only` matches this simulator, measured. `prompt_plus_output` matches real vLLM |
 | `--output-model` | `echo` | How to predict output length. `echo` sets it to the prompt length, matching this simulator. `max_tokens` is for real vLLM |
 | `--seed` | 0 | Seeds tie breaking. Without it two runs of the same trace are not comparable |
