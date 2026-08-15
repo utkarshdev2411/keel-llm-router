@@ -162,12 +162,14 @@ Relevant tuning flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-num-seqs` | 8 | Must match the backend setting or the slot term is wrong |
+| `--max-num-seqs` | 32 | Must match the backend setting or the slot term is wrong |
 | `--kv-capacity` | 8192 | Must match `kv-cache-size` multiplied by `block-size` |
 | `--theta` | 0.70 | Occupancy at which the convex penalty begins |
 | `--penalty` | 10.0 | Weight of the penalty above theta |
 | `--sigma` | 0.90 | Admission ceiling as a fraction of KV capacity |
-| `--kv-growth` | off | Model KV as growing per generated token. Off matches this simulator. Turn it on against real vLLM |
+| `--kv-model` | `prompt_only` | Whether a request's KV grows as it generates. `prompt_only` matches this simulator, measured. `prompt_plus_output` matches real vLLM |
+| `--output-model` | `echo` | How to predict output length. `echo` sets it to the prompt length, matching this simulator. `max_tokens` is for real vLLM |
+| `--seed` | 0 | Seeds tie breaking. Without it two runs of the same trace are not comparable |
 | `--verbose` | off | Log every completed request. Leave off during measurement |
 
 ## The sweep scripts
@@ -206,10 +208,68 @@ Treat a difference that appears only at p99 with suspicion. With fifteen hundred
 requests, p99 rests on roughly fifteen samples. If p95 and p99 move in the same
 direction by similar amounts, the result is more likely to be real.
 
-The two spread columns describe how evenly load landed. Request spread and token spread
-measure different things, and a policy that deliberately sends unequal request counts in
-order to equalise actual work will show high request spread and low token spread. That
-combination is the intended behaviour of a cost aware policy, not a fault.
+The three spread columns describe how evenly load landed, and none of them is the
+mechanism. That distinction cost a wrong conclusion once, so it is worth stating plainly.
+
+`DISP kv` is the spread of prompt tokens dispatched per backend across **every** request,
+rejections included. Read it as whether each backend did a fair share of total work over
+the run. `DISP req` is the same for request counts, and `least_conn` drives it toward zero
+by construction. `ok tok` covers successes only; do not read it as balance at all, because
+a backend that receives heavy traffic and rejects most of it registers as lightly loaded.
+
+**A cost aware policy can score worse on `DISP kv` while winning decisively on error
+rate, and that is not a contradiction.** Measured here at rate 8: `pressure` cut errors
+from 2.0% to 0.3% while showing *higher* cumulative KV spread than `least_conn`, roughly
+25% against 15%. Rejections are caused by instantaneous occupancy crossing the ceiling,
+not by unequal totals accumulated over a run. A policy that routes to whichever backend
+has headroom at this instant will produce uneven totals deliberately.
+
+For the mechanism, use `occupancy_stats.py`, which parses per backend occupancy out of a
+run log and reports how full the fullest backend is at a typical moment, how much of the
+run some backend spent at or above the admission ceiling, and the instantaneous spread.
+On the same runs that produced the cumulative numbers above:
+
+| rate | policy | instantaneous spread | time at or above 0.95 | err% |
+|---|---|---|---|---|
+| 8 | `least_conn` | 91.1% | 15.9% | 2.0% |
+| 8 | `pressure` | 56.8% | 8.8% | 0.3% |
+| 10 | `least_conn` | 96.9% | 30.7% | 3.5% |
+| 10 | `pressure` | 53.0% | 14.4% | 0.9% |
+
+Instantaneous spread halves, time in the danger zone halves, and error rate follows.
+Cumulative spread moves the other way. Both are true, and only one of them explains the
+result.
+
+## Verifying that a result set can be believed
+
+A run that has lost a third of its requests prints the same reassuring `Done.` as a clean
+one. Nothing in the normal output tells you whether the numbers mean what you think they
+mean, and this harness has produced confident wrong numbers more than once.
+
+`verify.py` asserts the invariants directly. Point it at a results directory.
+
+```bash
+./venv/bin/python verify.py results_compare
+./venv/bin/python verify.py results_knee --log results_knee/sweep_log.txt
+```
+
+It picks up `compare_log.txt` or `sweep_log.txt` automatically if either sits in the
+directory. Each check prints `PASS`, `FAIL`, `WARN` or `SKIP` with the reason, and the
+exit code is 1 if anything failed, so it can gate a pipeline.
+
+| Check | Asserts | Why it exists |
+|---|---|---|
+| request conservation | `req_id`s are contiguous with no duplicates | A dropped request is counted as neither success nor error, so it disappears from the error rate instead of showing up as a failure |
+| silent failures | No row is a success with zero tokens | KV rejections arrive as HTTP 200 with the error inside the SSE stream. Treating those as empty successes once made the error rate read 0.0% when the true rate was 61% |
+| error taxonomy | Errors really are KV exhaustion | The request path catches every exception into the same field, so connection refusals and timeouts get reported as "KV exhaustion rate" unless you look |
+| error latency | Errors returned instantly | A capacity rejection comes back in about 0.0s. A slow error is a timeout wearing the same label |
+| backend coverage | All four backends received traffic | A backend absent from the results was never routed to, usually a typo in the backend list |
+| length invariant | Output equals prompt in echo mode | If this breaks, the backend is not behaving as the KV projection assumes, and the projection is wrong |
+| trim sensitivity | Error rate is stable with and without trimming | The warmup and drain trim is defensible, but if it moves the headline number it is doing real work and must be disclosed |
+| KV accounting leak | `in_flight == 0` implies `occupancy == 0` | The strongest structural check available. Nonzero occupancy with nothing in flight means the router permanently believes memory is held that is not, and will under admit for the rest of the run |
+| coordinated omission | `lag_events` is near zero | Late dispatches mean offered load never reached the target rate and every latency number is optimistic |
+
+Run it before believing any comparison, and again before publishing anything.
 
 ## Things that will waste your time if you do not know them
 
@@ -228,13 +288,38 @@ prompts from a twenty thousand word random vocabulary for this reason. If you wa
 genuine prefix sharing, add it deliberately with `--shared-prefix-frac`.
 
 **This simulator allocates KV by prompt length at admission.** It does not grow the
-allocation as tokens are generated, which real vLLM does. That is why `--kv-growth`
-exists and why it defaults to off here.
+allocation as tokens are generated, which real vLLM does. That is why `--kv-model`
+exists and why it defaults to `prompt_only` here.
 
-**Echo mode ties output length to prompt length.** The trace generator sets prompt
-length to the larger of the desired prompt and desired output so there is enough text to
-echo. That produces long prompt with short output, which is the retrieval augmented
-pattern, but it cannot produce short prompt with long output.
+This was measured directly rather than assumed, and it is worth knowing how, because
+assuming the opposite cost this project several days. `kv_curve.py` sends one request to
+an otherwise idle backend and samples `/metrics` across its lifetime. A thousand word
+prompt generating a thousand tokens over twenty seconds held KV **flat at 0.1211 the
+entire time**, which is 992 tokens, which is 62 blocks of 16, which is the prompt alone.
+Generated tokens cost this backend nothing. Run it yourself if you change simulator
+versions.
+
+**Echo mode forces output length to equal prompt length, and ignores `max_tokens`
+entirely.** Measured: a 500 word prompt returns exactly 500 completion tokens whether
+`max_tokens` is 50, 200, or 5000. There is therefore exactly one length per request, not
+two, and the trace generator draws one.
+
+An earlier version of this file claimed the harness could produce long prompt with short
+output, the retrieval augmented pattern, by setting `max_tokens` below the prompt length.
+**That pattern never existed in any trace this repository generated.** The backend
+ignored the cap and echoed the full prompt every time. Prompt and output cannot be
+decoupled here at all; testing that shape needs `--backend-mode real` against real vLLM.
+
+**Capacity per backend is not KV divided by mean request size.** It is roughly three
+times smaller, because of length biased sampling. A request holds its KV for a time
+proportional to its length, so long requests linger, and the set of requests occupying a
+backend at any instant is therefore biased toward the long ones. A two thousand token
+request is present about fifteen times longer than a one hundred and thirty token one,
+so it is about fifteen times more likely to be there when you look. The figure that
+matters is `E[L²]/E[L]`, not `E[L]`, and for a heavy tailed distribution those differ by
+a factor of three or more. Predicting thirty two concurrent requests per backend from the
+mean, this harness measured KV exhaustion at thirteen to fifteen. `generate_trace.py`
+now computes both moments and prints the length biased mean.
 
 **Logging inside the request loop inflates the metric you are measuring.** A `print`
 call is a blocking syscall on a single threaded event loop, and while it runs no stream
@@ -259,13 +344,27 @@ inference backends.
 ## Layout
 
 ```
-generate_trace.py    build a reproducible trace
-loadgen.py           replay a trace under a routing policy
-compare.py           side by side comparison with trimming
-analyze.py           single file summary
-stage3_knee.sh       find the rate where backends start failing
-stage4_theta.sh      tune the pressure threshold at a given rate
-stage5_compare.sh    compare all policies across several rates
+generate_trace.py         build a reproducible trace
+loadgen.py                replay a trace under a routing policy
+compare.py                side by side comparison with trimming
+occupancy_stats.py        instantaneous occupancy from a run log, which is the
+                          mechanism metric compare.py cannot show
+verify.py                 assert measurement integrity on a results directory
+analyze.py                single file summary
+
+kv_curve.py               single request KV against time, for checking what a
+                          backend actually charges per request
+scrape_backend_counts.py  snapshot per backend counters from /metrics, needed
+                          for proxy runs where the generator cannot see which
+                          backend served a request
+restart_sims.sh           bring all four backends up cold
+
+stage3_knee.sh            find the rate where backends start failing
+stage4_theta.sh           tune the pressure threshold at a given rate
+stage5_compare.sh         compare all policies across several rates
+stage6_competitors.sh     compare against sgl-router
+
+BUGFIX_TRACKER.md         open defects and the state of the current fix cycle
 ```
 
 Traces, result CSVs and logs are generated artifacts and are not tracked.
