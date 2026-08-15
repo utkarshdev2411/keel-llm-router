@@ -3,26 +3,41 @@
 Produces a fixed file of (arrival_offset_ms, prompt, max_tokens) so every run
 replays byte-identical traffic.
 
-Output-length model
--------------------
-Real LLM output lengths are heavy-tailed, not bimodal. Default is lognormal:
+Backend behaviour, and why it constrains the workload
+-----------------------------------------------------
+llm-d-inference-sim in `--mode echo` replays the entire prompt back as the
+response and **ignores max_tokens completely**. Measured directly:
 
-    median 120 tokens, sigma 1.1, clipped to [20, 3000]
+    500 words, max_tokens=50    -> 500 completion tokens
+    500 words, max_tokens=200   -> 500 completion tokens
+    500 words, max_tokens=5000  -> 500 completion tokens
+
+So in echo mode: **output length == prompt length, always.** There is exactly
+one length per request, not two.
+
+An earlier version of this file drew prompt and output separately and set
+`prompt_words = max(p, o)`, `max_tokens = o`, believing max_tokens would
+truncate the echo and yield LONG PROMPT / SHORT OUTPUT (a RAG-like pattern) for
+about 64% of requests. **That pattern never existed in the generated traffic.**
+The backend ignored max_tokens and echoed the full prompt every time, so the
+real workload was always prompt == output. Any result or document describing a
+prompt/output split from a trace made before 2026-08-11 is describing something
+that did not happen.
+
+Consequences, both load-bearing:
+
+  * KV per request is prompt + generated = **2 x prompt**, not prompt. The
+    router must project that (see loadgen.py --output-model).
+  * Prompt/output decoupling is impossible here. Testing long-prompt/short-output
+    needs `--backend-mode real` against real vLLM in stage 0b.
+
+Length model
+------------
+Heavy-tailed, as real chat traffic is. Default lognormal over the single
+per-request length:
+
+    median 120, sigma 1.1, clipped to [20, 3000]
       p50 ~ 120   p90 ~ 490   p99 ~ 1550   mean ~ 220
-
-Prompt/output decoupling (echo mode)
-------------------------------------
-The simulator's echo mode returns the prompt, truncated by max_tokens. So:
-
-    prompt_words = max(p, o)   -> enough text to echo
-    max_tokens   = o           -> truncates the echo to exactly o
-
-giving actual_prompt = max(p, o) and actual_output = o. When p > o this yields
-LONG PROMPT / SHORT OUTPUT (the RAG pattern), which is where cost-aware and
-count-based routing diverge most.
-
-Known limit: cannot produce SHORT prompt / LONG output. Documented stage-0a
-limitation; real vLLM in stage 0b covers that case.
 """
 
 import json
@@ -84,6 +99,13 @@ def sample_lengths(kind, rng, args):
         return 800, 800
 
     if kind == "lognormal":
+        if args.backend_mode == "echo":
+            # One draw. The backend echoes the prompt, so output == prompt and
+            # a second independent draw would be fiction.
+            n = lognormal_clipped(rng, args.out_median, args.out_sigma,
+                                  args.out_min, args.out_max)
+            return n, n
+        # real vLLM: prompt and output are genuinely independent
         o = lognormal_clipped(rng, args.out_median, args.out_sigma,
                               args.out_min, args.out_max)
         p = lognormal_clipped(rng, args.prompt_median, args.prompt_sigma,
@@ -106,20 +128,30 @@ def generate_trace(kind, num_requests, rate_per_sec, seed, args):
     for _ in range(num_requests):
         t += rng.expovariate(rate_per_sec)
         p_want, o_want = sample_lengths(kind, rng, args)
-        prompt_words = max(p_want, o_want)     # must be long enough to echo o
         pre = rng.choice(prefixes) if prefixes and rng.random() < args.shared_prefix_frac else None
+        if args.backend_mode == "echo":
+            # Output is forced to equal the prompt. max_tokens is set above it so
+            # the request is not *asking* to be truncated, but the backend ignores
+            # it either way -- it is recorded only for the stage-0b replay.
+            prompt_words = p_want
+            max_tokens = p_want + 50
+            expected_output = p_want
+        else:
+            prompt_words = p_want
+            max_tokens = o_want
+            expected_output = o_want
         trace.append({
             "offset_ms": round(t * 1000),
             "prompt": make_prompt(rng, prompt_words, pre),
-            "max_tokens": o_want,
+            "max_tokens": max_tokens,
             "_prompt_tokens": prompt_words,     # for verification only
-            "_expected_output": o_want,
+            "_expected_output": expected_output,
             "_shared": bool(pre),
         })
     return trace
 
 
-def summarize(trace):
+def summarize(trace, mode):
     outs = sorted(r["_expected_output"] for r in trace)
     prompts = sorted(r["_prompt_tokens"] for r in trace)
 
@@ -138,16 +170,24 @@ def summarize(trace):
     print(f"  prompt tokens   : p50={pct(prompts,0.50)}  p90={pct(prompts,0.90)}  "
           f"p99={pct(prompts,0.99)}  max={prompts[-1]}  mean={total_p/len(prompts):.0f}")
     print(f"  total out tokens: {total_out:,}")
-    print(f"  long-prompt/short-output requests: {decoupled} "
-          f"({decoupled/len(trace)*100:.0f}%)")
+    if mode == "echo":
+        print(f"  NOTE: backend-mode=echo -> output == prompt for every request.")
+        print(f"        max_tokens is recorded but the backend ignores it.")
+    else:
+        print(f"  long-prompt/short-output requests: {decoupled} "
+              f"({decoupled/len(trace)*100:.0f}%)")
 
     # Rough capacity note: helps pick rates for the knee sweep.
-    mean_out = total_out / len(outs)
+    mean_out = total_out / len(outs)  # tokens actually generated per request
     svc = mean_out * 0.020            # inter-token-latency 20ms, unloaded
     # Backends slow down as they fill (--time-factor-under-load), so service
     # time inflates with utilisation and effective capacity DROPS. Solving
     # u = lam*svc*(1+(F-1)*u)/S for u=1 gives the true saturation rate.
-    mean_kv = (total_p + total_out) / len(outs)   # prompt + generated, held per request
+    # KV held per request = prompt + everything generated. In echo mode the
+    # generated part equals the prompt, so this is 2 x prompt. An earlier version
+    # of this estimate used prompt only, overstating capacity by ~2x and sending
+    # every sweep far past saturation.
+    mean_kv = (total_p + total_out) / len(outs)
     KV_PER_BACKEND, BACKENDS, F = 8192.0, 4, 2.5
     kv_slots = KV_PER_BACKEND / mean_kv           # concurrent requests before KV exhaustion
     S = kv_slots * BACKENDS
@@ -182,6 +222,12 @@ if __name__ == "__main__":
     ap.add_argument("--prompt-min", type=int, default=20)
     ap.add_argument("--prompt-max", type=int, default=4000)
 
+    ap.add_argument("--backend-mode", default="echo", choices=["echo", "real"],
+                    help="echo (default): llm-d-inference-sim --mode echo, which replays "
+                         "the prompt and ignores max_tokens, so output == prompt and only "
+                         "one length is drawn. real: prompt and output drawn independently, "
+                         "for stage 0b against real vLLM.")
+
     # shared prefixes: keep at 0 for Phase 0 (make KV bind); raise for Phase 4
     ap.add_argument("--shared-prefix-frac", type=float, default=0.0)
     ap.add_argument("--shared-prefix-pool", type=int, default=5)
@@ -198,4 +244,4 @@ if __name__ == "__main__":
         json.dump(trace, f)
 
     print(f"Wrote {a.out}  (kind={a.kind}, rate={a.rate}/s, seed={a.seed})")
-    summarize(trace)
+    summarize(trace, a.backend_mode)

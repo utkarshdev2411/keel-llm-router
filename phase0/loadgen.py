@@ -115,7 +115,11 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
         "stream": True,
     }
     charged = charged0        # kvts debt (kvts arms only)
-    kv_held = (p + o_hat0) if state["kv_growth"] else p   # projected peak KV
+    # Projected peak KV for this request: the prompt, plus everything it will
+    # generate. Both terms always count -- an earlier version projected the
+    # prompt alone, which undercounted by exactly 2.0x against this simulator
+    # and left the router believing backends were half as full as they were.
+    kv_held = p + o_hat0
     o_hat = o_hat0
     c = 0
     first_tok = None
@@ -155,12 +159,14 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
                 # Output ran past the estimate: extend it and re-charge both
                 # accounting channels. Under-estimating output length is what
                 # causes preemption, so this must never lag reality.
-                if c >= o_hat:
+                # Strictly greater: under output-model=echo, o_hat equals the
+                # prompt length exactly, so c reaches it on the final token and
+                # `>=` would fire a spurious recharge on every request.
+                if c > o_hat:
                     o_hat += 50
-                    if state["kv_growth"]:
-                        new_kv = p + o_hat
-                        state["kv_proj"][backend] += (new_kv - kv_held)
-                        kv_held = new_kv
+                    new_kv = p + o_hat
+                    state["kv_proj"][backend] += (new_kv - kv_held)
+                    kv_held = new_kv
 
                 if policy.startswith("kvts"):
                     new = kvts_remaining(p, 0, c, o_hat)
@@ -224,7 +230,7 @@ async def run(trace_path, backends, out_path, policy, cfg):
         "penalty": cfg["penalty"],
         "sigma": cfg["sigma"],
         "verbose": cfg["verbose"],
-        "kv_growth": cfg["kv_growth"],
+        "output_model": cfg["output_model"],
     }
     prog = {"total": len(trace), "disp": 0, "done": 0}
     stop = asyncio.Event()
@@ -246,10 +252,15 @@ async def run(trace_path, backends, out_path, policy, cfg):
                 await asyncio.sleep(0)   # always yield: state must never be stale
 
             p = len(req["prompt"].split())
-            o_hat = req["max_tokens"]
-            # kv_growth=False matches this simulator (allocates by prompt only).
-            # Real vLLM grows KV per generated token -> use True in stage 0b.
-            kv_new = (p + o_hat) if cfg["kv_growth"] else p
+            # How many tokens will this request generate?
+            #   echo       - llm-d-inference-sim in --mode echo replays the whole
+            #                prompt back and IGNORES max_tokens entirely. Measured:
+            #                500 words with max_tokens=50 returns 500 tokens. So the
+            #                output length IS the prompt length.
+            #   max_tokens - real vLLM stops at max_tokens or EOS, whichever first,
+            #                so max_tokens is a true upper bound. Use for stage 0b.
+            o_hat = p if cfg["output_model"] == "echo" else req["max_tokens"]
+            kv_new = p + o_hat
             charge = kvts_remaining(p, 0, 0, o_hat) if policy.startswith("kvts") else 0.0
 
             if policy.startswith("pressure"):
@@ -307,10 +318,12 @@ if __name__ == "__main__":
     ap.add_argument("--theta", type=float, default=0.70)   # knee: penalty starts here
     ap.add_argument("--penalty", type=float, default=10.0) # convex weight above the knee
     ap.add_argument("--sigma", type=float, default=0.90)   # admission ceiling
-    ap.add_argument("--kv-growth", action="store_true",
-                    help="model KV as growing per generated token (real vLLM). "
-                         "OFF matches llm-d-inference-sim, which allocates by "
-                         "prompt length at admission only.")
+    ap.add_argument("--output-model", default="echo", choices=["echo", "max_tokens"],
+                    help="how to predict a request's output length, which sets the KV "
+                         "projection to prompt+output. 'echo' (default) matches "
+                         "llm-d-inference-sim --mode echo, which replays the prompt and "
+                         "ignores max_tokens, so output == prompt. 'max_tokens' matches "
+                         "real vLLM, which caps at max_tokens; use it for stage 0b.")
     ap.add_argument("--verbose", action="store_true",
                     help="log every completed request. OFF by default: print() "
                          "blocks the event loop and inflates measured TTFT.")
@@ -323,6 +336,6 @@ if __name__ == "__main__":
         "penalty": a.penalty,
         "sigma": a.sigma,
         "verbose": a.verbose,
-        "kv_growth": a.kv_growth,
+        "output_model": a.output_model,
     }
     asyncio.run(run(a.trace, a.backends.split(","), a.out, a.policy, cfg))

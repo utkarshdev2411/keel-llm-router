@@ -46,22 +46,37 @@ echo "############################################"
 echo "### sgl-router arms (IT picks the backend)"
 echo "############################################"
 for SP in cache_aware power_of_two; do
-  # one router process per policy, on its own port
+  # One router process per policy, on its own port. Kill the PREVIOUS
+  # instance by tracked PID before starting the next -- sgl-router also binds
+  # a Prometheus exporter on a port derived from --port (see
+  # start_competitor_router.sh), so a stale prior instance left running
+  # causes the next one to panic on bind and get silently skipped.
+  if [ -f "sglrouter_${PREV_SP:-none}.pid" ]; then
+    kill "$(cat "sglrouter_${PREV_SP}.pid")" 2>/dev/null || true
+    sleep 2
+  fi
   PORT=9000
   [ "$SP" = "power_of_two" ] && PORT=9001
-  pkill -f "port $PORT" 2>/dev/null || true
   ./start_competitor_router.sh "$SP" "$PORT" >/dev/null
+  PREV_SP="$SP"
   echo ""
   echo "--- sglrouter:$SP (warming up) ---"
   sleep 25
   if ! curl -s --max-time 10 -o /dev/null "http://127.0.0.1:${PORT}/v1/models"; then
-    echo "    router on $PORT did not come up, skipping"
+    echo "    router on $PORT did not come up -- check sglrouter_${SP}.log -- skipping"
     continue
   fi
+  $PY scrape_backend_counts.py "$OURS" --out "results_compet/r${R}_sglrouter-${SP}_before.json"
   $PY loadgen.py --trace "$TRACE" --backends "http://127.0.0.1:${PORT}" \
       --out "results_compet/r${R}_sglrouter-${SP}.csv" \
       --policy proxy --max-num-seqs 32
+  $PY scrape_backend_counts.py "$OURS" --out "results_compet/r${R}_sglrouter-${SP}_after.json"
 done
+
+# final cleanup
+if [ -f "sglrouter_${PREV_SP:-none}.pid" ]; then
+  kill "$(cat "sglrouter_${PREV_SP}.pid")" 2>/dev/null || true
+fi
 
 echo ""
 echo "============================================"
