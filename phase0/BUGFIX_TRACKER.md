@@ -19,13 +19,15 @@ pick up from here without re-reading the whole history.
 | A | Code fixes, no runs | ◐ A1-A4, A6, A7 done + B1 re-fixed via --kv-model; only A5 (proxy snapshots) left |
 | B | Verify the fixes | ◐ B1-check PASSED; B2-check (cache confound) now moot, A7 removes it structurally |
 | C | Re-find the knee | ◐ KNEE = 8 req/s, provisional — rate 12/14 non-monotonic, needs repeats |
-| D | Re-run comparisons | ☐ NOT STARTED |
+| D | Re-run comparisons | ◐ D1 DONE across rates 8-14, 3-7x advantage holds and widens; D2 (sgl-router) left |
 | E | Correct the documentation | ☐ NOT STARTED |
 
 **Last worked on:** B1-check PASSED with `--kv-model prompt_only`. Router and backend KV now
 track within sampling noise across the whole run.
-**Next action:** D1 — run `./stage5_compare.sh` (rates 8 and 10, 3 repeats per cell).
-A2/A3/A4 are done, so runs are now reproducible and imbalance is measured over all rows.
+**Next action:** D2 — competitor comparison against sgl-router (`./stage6_competitors.sh`,
+already fixed for the port-collision and PID-tracking bugs from 2026-08-11). Then Phase E
+(correct journey/phase-0.md and README.md with the real rate 8-14 numbers above, replacing
+the invalid pre-fix 73%/27%/32% table).
 
 ---
 
@@ -287,8 +289,77 @@ computes as a trivial 0.0%. `scrape_backend_counts.py` exists but is not wired i
 **Not blocking each other.** Either order is fine.
 **Estimate:** 60 min
 
-- [ ] **D1. Policy comparison** (`least_conn`, `kvts`, `pressure`) at the new knee, cold
-      containers between arms, fixed seed.
+- [x] **D1. Policy comparison** (`least_conn`, `kvts`, `pressure`) at the new knee, cold
+      containers between arms, fixed seed. **DONE 2026-08-15**, rates 8 and 10, 3 repeats
+      each, cold restart before every arm, seed fixed per repeat and identical across
+      policies. `verify.py`: 9 passed, 1 warning, 0 failed.
+
+      | rate | policy | err% (3 runs) | mean |
+      |---|---|---|---|
+      | 8  | least_conn | 1.0 / 2.7 / 2.4    | 2.0% |
+      | 8  | kvts       | 8.4 / 11.4 / 9.2   | 9.7% |
+      | 8  | pressure   | 0.3 / 0.3 / 0.3    | **0.3%** |
+      | 10 | least_conn | 2.7 / 3.2 / 4.5    | 3.5% |
+      | 10 | kvts       | 17.9 / 11.1 / 15.5 | 14.8% |
+      | 10 | pressure   | 1.1 / 0.9 / 0.8    | **0.9%** |
+
+      `pressure` cuts errors ~6x at rate 8 and ~4x at rate 10, with very low variance
+      (0.3/0.3/0.3). It also serves more requests (909 vs ~893 of 912 kept). `kvts` is
+      decisively worse than plain least-connections at both rates — independent
+      confirmation of its refutation, now on corrected code.
+
+      **Cost:** `pressure` has slightly worse tail TTFT — p99 79ms vs 68ms at rate 8.
+      Disclose this. It trades ~10ms of p99 for a 6x error reduction.
+
+      **MECHANISM CORRECTION — important.** `DISP kv` (cumulative dispatched tokens) was
+      introduced as the mechanism metric and is the WRONG quantity. `pressure` scored
+      *higher* cumulative spread than `least_conn` (~25% vs ~15%) while winning on errors.
+      Not a contradiction: rejections are caused by INSTANTANEOUS occupancy crossing the
+      ceiling, not by unequal run totals. Added `occupancy_stats.py`, which parses the
+      ticker's per-backend occupancy out of a run log:
+
+      | rate | policy | inst spread | % time >=0.95 | err% |
+      |---|---|---|---|---|
+      | 8  | least_conn | 91.1% | 15.9% | 2.0% |
+      | 8  | pressure   | 56.8% |  8.8% | 0.3% |
+      | 10 | least_conn | 96.9% | 30.7% | 3.5% |
+      | 10 | pressure   | 53.0% | 14.4% | 0.9% |
+
+      Instantaneous spread halves, time in the danger zone halves, error rate follows —
+      and it tracks monotonically across `kvts` too. **The claim is "equalises load at each
+      moment", NOT "equalises total load".** `compare.py`'s legend and `phase0/README.md`
+      have been corrected; the earlier framing was wrong.
+
+      **UPDATE 2026-08-15 — extended to rates 12 and 14. Advantage holds and the absolute
+      gap widens under heavier stress. This is the result to publish.**
+
+      | rate | least_conn err% | pressure err% | ratio | least_conn %>=0.95 occ | pressure %>=0.95 occ |
+      |---|---|---|---|---|---|
+      | 8  | 2.0%  | 0.3% | 6.7x | 15.9% | 8.8%  |
+      | 10 | 3.5%  | 0.9% | 3.9x | 30.7% | 14.4% |
+      | 12 | 6.1%  | 1.9% | 3.2x | 35.4% | 14.9% |
+      | 14 | 10.8% | 3.3% | 3.3x | 42.0% | 23.8% |
+
+      Ratio stabilizes around 3-4x rather than decaying, and the absolute pp gap widens
+      (4.2pp at 12, 7.5pp at 14). `kvts` stays decisively worse than the plain baseline at
+      every rate — refuted a third time, independently, on corrected code.
+
+      `occupancy_stats.py` confirms the mechanism at 12/14 too. Worth being precise about
+      HOW when asked: `max_occ` (how full the fullest backend gets) barely differs between
+      the two policies (0.78 vs 0.75 at rate 12) — `pressure` does not keep peaks
+      dramatically lower. The win is `inst spread` and time-at-ceiling: `least_conn` sits
+      at or above the admission ceiling on SOME backend 35-42% of the time at rates 12/14;
+      `pressure` cuts that to 15-24%. It wins by spending less time in the danger zone, not
+      by lowering the ceiling.
+
+      `verify.py` on the full rate 8/10/12/14 set: 9 passed, 1 warning, 0 failed. The trim-
+      sensitivity warning now also appears on 2 of 3 `kvts__run1` cells at rate 12 and all
+      three at rate 14 — still confined entirely to the refuted `kvts` arm, never
+      `least_conn` or `pressure`.
+
+      **Caveat, still open:** absolute error rates at rate 8 are low (0.3% vs 2.0%), so
+      that single ratio (6.7x) rests on small counts. Rates 10-14 are on firmer ground with
+      more error events per run.
 
 - [ ] **D2. Competitor comparison** against `sgl-router` (`cache_aware`, `power_of_two`),
       with metrics snapshots so spread is real.
@@ -397,3 +468,18 @@ Append findings here as work proceeds, newest last.
   `occupancy[8001=0.99 8002=0.52 8003=0.99 8004=0.98]`. Identical request counts, three
   backends at capacity and one half idle. That is the entire argument for the project in one
   line of log output — keep it for the journey doc and the LinkedIn post.
+- **2026-08-15** — Added `verify.py`, a measurement-integrity checker, and documented it in
+  `phase0/README.md`. Nine assertions, each corresponding to a bug that actually happened
+  here: request conservation, silent zero-token successes, error taxonomy (is err% really KV
+  exhaustion, or is it also catching connection failures), error latency, backend coverage,
+  echo-mode length invariant, trim sensitivity, KV accounting leak
+  (`in_flight==0 => occupancy==0`), and coordinated omission. Exits 1 on any FAIL.
+  Run against `results_knee`: **9 passed, 0 warnings, 0 failed, 1 skipped** (length invariant
+  skipped — those CSVs predate the `prompt_tokens` column). Notably the 411 recorded errors
+  are 100% genuine KV exhaustion with no connection failures mixed in, and there are zero KV
+  accounting leaks across all 6 runs.
+  Also corrected `phase0/README.md`, which still documented `--kv-growth` (removed), a
+  `--max-num-seqs` default of 8 (now 32), and the refuted long-prompt/short-output RAG claim.
+  Worth noting: that README already stated correctly that the simulator allocates KV by
+  prompt length at admission and does not grow it. The B1 "fix" contradicted documentation
+  that was right all along.

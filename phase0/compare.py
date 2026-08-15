@@ -120,17 +120,17 @@ if __name__ == "__main__":
     print(f"warmup/drain trim: {a.trim:.0%} at each end "
           f"(~{kept}/{raw} requests kept per run)")
     print()
-    print(f"{'rate':>6} {'policy':<22} {'n':>5} {'err':>5} {'err%':>6} "
+    print(f"{'rate':>6} {'policy':<30} {'n':>5} {'err':>5} {'err%':>6} "
           f"{'TTFT p50':>10} {'p95':>10} {'p99':>10} "
           f"{'DISP req':>9} {'DISP kv':>9} {'ok tok':>9}")
-    print("-" * 127)
+    print("-" * 135)
 
     last = None
     for r in rows:
         if last is not None and r["rate"] != last:
             print()
         kv = "n/a" if r["disp_kv_spread"] is None else f"{r['disp_kv_spread']:.1f}%"
-        print(f"{r['rate']:>6} {r['policy']:<22} {r['n']:>5} {r['errors']:>5} "
+        print(f"{r['rate']:>6} {r['policy']:<30} {r['n']:>5} {r['errors']:>5} "
               f"{r['err_pct']:>5.1f}% "
               f"{fmt_ms(r['p50']):>10} {fmt_ms(r['p95']):>10} {fmt_ms(r['p99']):>10} "
               f"{r['disp_req_spread']:>8.1f}% {kv:>9} {r['tok_spread']:>8.1f}%")
