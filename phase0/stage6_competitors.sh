@@ -29,7 +29,8 @@
 #    hold the real per-backend distribution; diff them by hand until A5 wires
 #    them into compare.py.
 #
-# REWRITTEN 2026-08-15 to match the rigor of the D1 run (see BUGFIX_TRACKER.md):
+# REWRITTEN 2026-08-15 to match the rigor of the policy comparison (see
+# ../journey/phase-0.md section 9):
 #   - REPEATS (default 3). The previous version ran each arm ONCE and invited a
 #     comparison against D1's 3-run averages. pressure at rate 10 spanned
 #     0.8-1.1% across its repeats, so a single run cannot distinguish a real

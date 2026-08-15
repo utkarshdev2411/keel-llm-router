@@ -40,19 +40,47 @@ responses have returned.
 `compare.py` reads one or more result CSVs and prints a side by side table with warmup
 and drain trimmed off.
 
+`verify.py` asserts ten measurement invariants on a results directory and exits non zero if
+any fail. Run it before believing a number. Every check in it corresponds to a bug that
+actually happened here and silently corrupted results for several runs before being caught.
+
+`occupancy_stats.py` reports instantaneous per backend occupancy from a run log. This is the
+metric that explains *why* a policy wins, and `compare.py` structurally cannot show it.
+
+`proxy_spread.py` recovers the real per backend distribution for runs driven through an
+external router, by diffing Prometheus counters from before and after the run.
+
+`kv_curve.py` sends one request to an idle backend and plots its memory against time. Use it
+to check what a backend actually charges per request before trusting any KV projection.
+
+`scrape_backend_counts.py` snapshots per backend Prometheus counters to JSON.
+
 `analyze.py` is a simpler single file summary, kept for quick checks.
 
-The three `stage*.sh` scripts drive common sweeps and are described further down.
+`restart_sims.sh` brings all four backends up cold and waits until each answers. The
+`stage*.sh` scripts drive the sweeps and are described further down.
 
 ## Requirements
 
-Python 3.9 or newer, Docker, and roughly 2 GB of free RAM for four simulated backends.
+Python 3.9 or newer, Docker, and roughly 2 GB of free RAM for four simulated backends. No
+GPU, no model weights, no API keys.
 
 ```bash
+cd phase0
 python3 -m venv venv
-source venv/bin/activate
-pip install httpx
+./venv/bin/pip install httpx
 ```
+
+`httpx` is all you need for everything except the competitor benchmark. That one additionally
+needs SGLang's router, which is a large install and entirely optional:
+
+```bash
+./venv/bin/pip install sglang-router
+```
+
+Every command in this document uses `./venv/bin/python` explicitly rather than expecting an
+activated virtualenv. If you have conda or another Python on your PATH, a bare `python3` will
+usually be the wrong one and will fail with `ModuleNotFoundError: httpx`.
 
 ## Starting the backends
 
@@ -64,22 +92,22 @@ cache limit, all without a GPU.
 docker pull ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
 ```
 
-Start four instances on ports 8001 through 8004. Run each command as a single line.
+Start four instances on ports 8001 through 8004. Use the helper script, which brings them up
+cold and then polls each one until it actually answers:
 
 ```bash
-docker run -d --name sim1 -p 8001:8000 -e POD_IP=127.0.0.1 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 --port 8000 --model test-model --mode echo --max-model-len 8192 --enable-kvcache --kv-cache-size 512 --block-size 16 --max-num-seqs 32 --time-to-first-token 50ms --inter-token-latency 20ms --time-factor-under-load 2.5
+./restart_sims.sh 64
 ```
 
-```bash
-docker run -d --name sim2 -p 8002:8000 -e POD_IP=127.0.0.1 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 --port 8000 --model test-model --mode echo --max-model-len 8192 --enable-kvcache --kv-cache-size 512 --block-size 16 --max-num-seqs 32 --time-to-first-token 50ms --inter-token-latency 20ms --time-factor-under-load 2.5
-```
+It is safe to re-run at any time and is the correct way to reset between measurements. The
+argument is `--max-num-seqs`, discussed in the flag table below.
+
+If you prefer to do it by hand, this is the equivalent for one backend. Run it as a single
+line: multi-line pastes with backslash continuations get broken by terminal wrapping, and the
+container then starts with only some of its flags applied.
 
 ```bash
-docker run -d --name sim3 -p 8003:8000 -e POD_IP=127.0.0.1 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 --port 8000 --model test-model --mode echo --max-model-len 8192 --enable-kvcache --kv-cache-size 512 --block-size 16 --max-num-seqs 32 --time-to-first-token 50ms --inter-token-latency 20ms --time-factor-under-load 2.5
-```
-
-```bash
-docker run -d --name sim4 -p 8004:8000 -e POD_IP=127.0.0.1 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 --port 8000 --model test-model --mode echo --max-model-len 8192 --enable-kvcache --kv-cache-size 512 --block-size 16 --max-num-seqs 32 --time-to-first-token 50ms --inter-token-latency 20ms --time-factor-under-load 2.5
+docker run -d --name sim1 -p 8001:8000 -e POD_IP=127.0.0.1 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 --model test-model --mode echo --max-model-len 8192 --enable-kvcache --kv-cache-size 512 --block-size 16 --max-num-seqs 64 --time-to-first-token 50ms --inter-token-latency 20ms --time-factor-under-load 2.5
 ```
 
 Confirm they came up, and check the logs rather than trusting the process list, because
@@ -101,7 +129,7 @@ What the flags do, and which ones are not optional:
 | `--mode echo` | Returns the prompt back as the response, which is what lets the trace control output length |
 | `--enable-kvcache` | Turns on KV accounting. Without it the cache limit is never enforced |
 | `--kv-cache-size 512` and `--block-size 16` | 512 blocks of 16 tokens gives 8192 tokens of KV per backend |
-| `--max-num-seqs 32` | Concurrency cap. Set above the KV bound so that KV is the binding constraint |
+| `--max-num-seqs 64` | Concurrency cap. Must sit well ABOVE the KV bound, or the slot limit binds first and hides the thing being measured. At 32 the two bind at almost the same point, which partly masks KV exhaustion |
 | `--max-model-len 8192` | Per request context limit. Must exceed your longest prompt or those requests fail |
 | `--inter-token-latency 20ms` | Simulated decode speed |
 | `--time-factor-under-load 2.5` | How much the backend slows as it fills. At the default of 1.0 load has no effect on latency at all, which makes most experiments meaningless |
@@ -114,24 +142,155 @@ docker stop sim1 sim2 sim3 sim4 && docker rm sim1 sim2 sim3 sim4
 
 ## A first run
 
-Generate a trace, replay it under two policies, and compare.
+Ten minutes, start to finish. Generate a trace, replay it under two policies, compare, and
+check that the measurement is trustworthy.
 
 ```bash
-python3 generate_trace.py --kind lognormal --num-requests 1500 --rate 8 --out trace_r8.json
+./restart_sims.sh 64
 
-python3 loadgen.py --trace trace_r8.json \
-  --backends http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004 \
-  --out r8_least_conn.csv --policy least_conn --max-num-seqs 32
+./venv/bin/python generate_trace.py --kind lognormal --num-requests 600 --rate 12 --out /tmp/r12_demo.json
 
-python3 loadgen.py --trace trace_r8.json \
-  --backends http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004 \
-  --out r8_pressure.csv --policy pressure --max-num-seqs 32
+BK=http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004
 
-python3 compare.py r8_least_conn.csv r8_pressure.csv
+./venv/bin/python loadgen.py --trace /tmp/r12_demo.json --backends "$BK" \
+  --out /tmp/r12_least_conn.csv --policy least_conn --max-num-seqs 64 --seed 1
+
+./restart_sims.sh 64
+
+./venv/bin/python loadgen.py --trace /tmp/r12_demo.json --backends "$BK" \
+  --out /tmp/r12_pressure.csv --policy pressure --max-num-seqs 64 --seed 1
+
+./venv/bin/python compare.py /tmp/r12_least_conn.csv /tmp/r12_pressure.csv
 ```
 
-The trace generator prints a summary of what it built, including a capacity estimate
-that tells you roughly which arrival rates will saturate the backends.
+Three things about this that are not incidental:
+
+The `restart_sims.sh` between the two runs is not optional if you intend to believe the
+result. The second policy would otherwise inherit whatever cache the first one warmed.
+
+Rate 12 is chosen because it is past the knee, where backends are actually failing. At rate 8
+with a short run both policies come back near zero errors and the comparison shows nothing,
+or worse, shows noise pointing the wrong way.
+
+Result files are named `r<rate>_<policy>.csv` because `compare.py` parses the rate out of the
+filename. Name them something else and the rate column reads `?`.
+
+**This is a smoke test, not a measurement.** Six hundred requests through a single run of each
+policy tells you the pipeline works. It does not tell you which policy is better: at that
+sample size the difference between two runs of the *same* policy can exceed the difference
+between policies. The real numbers come from `stage5_compare.sh`, which runs 1500 requests per
+cell, three times per cell, with cold backends between every arm.
+
+---
+
+## The full Phase 0 workflow
+
+This is the complete sequence that produced the published results, in order. Each stage
+depends on the one before it.
+
+### Step 0. Sanity checks before measuring anything
+
+Two checks worth running once on any new simulator version or machine, because both have
+silently invalidated results here before.
+
+**Does the backend charge KV the way the router assumes?** This sends one request to an idle
+backend and samples its memory across the whole request lifetime.
+
+```bash
+docker run -d --name simsolo -p 8005:8000 -e POD_IP=127.0.0.1 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 --model test-model --mode echo --max-model-len 8192 --enable-kvcache --kv-cache-size 512 --block-size 16 --max-num-seqs 64 --time-to-first-token 50ms --inter-token-latency 20ms --time-factor-under-load 2.5
+
+sleep 5
+./venv/bin/python kv_curve.py --backend http://localhost:8005 --words 1000
+docker rm -f simsolo
+```
+
+It prints a verdict. Against `llm-d-inference-sim` the memory usage should be **flat** for the
+whole request and equal to the prompt alone, which is why `--kv-model prompt_only` is the
+default. If it climbs instead, the backend grows memory during generation like real vLLM does,
+and every run needs `--kv-model prompt_plus_output`.
+
+**Does the KV limit actually bind?** Generate a trace and read the capacity estimate:
+
+```bash
+./venv/bin/python generate_trace.py --kind lognormal --num-requests 500 --rate 8 --out /tmp/check.json
+```
+
+The output reports a length-biased mean and a saturation rate. If the concurrent-requests
+figure is close to `--max-num-seqs`, the slot limit will bind before the memory limit and the
+experiment measures the wrong constraint. Raise `--max-num-seqs`.
+
+**Treat the saturation figure as a starting point for the sweep, not as ground truth.** It is
+a closed-form estimate and it has been wrong in both directions. The earlier version divided
+capacity by the *mean* request size and overestimated capacity by about three times. The
+current version uses `E[L²]/E[L]`, which is the correct statistic, but `E[L²]` is dominated by
+the few longest requests in the sample and is therefore noisy and pessimistic: on the
+reference setup it suggests roughly 3 req/s while the measured knee is 8. Use it to choose a
+sweep range, then let `stage3_knee.sh` tell you where the knee actually is.
+
+### Step 1. Find the knee
+
+No policy can show an advantage below the point where backends start failing, and none can
+help far above it. This sweeps arrival rate to locate that point.
+
+```bash
+./stage3_knee.sh 2>&1 | tee results_knee/sweep_log.txt
+```
+
+Roughly 20-30 minutes. Read the `err%` column and pick the first rate where errors are
+material but the system is not collapsed. On the reference setup that is **8 req/s**.
+
+### Step 2. Compare the policies
+
+```bash
+RATES="8 10 12 14" ./stage5_compare.sh 2>&1 | tee results_compare/compare_log.txt
+```
+
+Roughly two hours for four rates at three repeats each. Override the defaults with
+environment variables:
+
+```bash
+RATES="8 10" REPEATS=3 POLICIES="least_conn pressure" ./stage5_compare.sh
+```
+
+### Step 3. Compare against a real competitor
+
+Needs `sglang-router` installed. Puts SGLang's production Rust router in front of the same
+backends and drives it as an external proxy.
+
+```bash
+./stage6_competitors.sh 10 2>&1 | tee results_compet/compet_log.txt
+```
+
+Roughly 90 minutes. The first argument is the arrival rate.
+
+### Step 4. Verify the measurements before believing them
+
+```bash
+./venv/bin/python verify.py results_compare
+./venv/bin/python verify.py results_compet
+```
+
+Ten assertions, described in the next section. Exits non-zero if any fail. Run this before
+quoting any number from a results directory.
+
+### Step 5. Analyse
+
+```bash
+# headline comparison table
+./venv/bin/python compare.py results_compare/*.csv
+
+# the mechanism: instantaneous occupancy, parsed from the run log
+./venv/bin/python occupancy_stats.py results_compare/compare_log.txt
+
+# real per-backend distribution for external-router runs
+./venv/bin/python proxy_spread.py results_compet
+```
+
+### Tearing down
+
+```bash
+docker rm -f sim1 sim2 sim3 sim4
+```
 
 ## Routing policies
 
@@ -172,25 +331,61 @@ Relevant tuning flags:
 | `--seed` | 0 | Seeds tie breaking. Without it two runs of the same trace are not comparable |
 | `--verbose` | off | Log every completed request. Leave off during measurement |
 
-## The sweep scripts
+## The scripts, and what each one takes
 
-`stage3_knee.sh` sweeps arrival rate with a single policy to find where the backends
-begin to fail. Below that point no policy can demonstrate an advantage because nothing
-is under stress, and far above it none can help because the system is simply overloaded.
-Everything else should be run at or just past that rate.
+| script | argument | what it does | time |
+|---|---|---|---|
+| `restart_sims.sh` | max-num-seqs (default 64) | brings all four backends up cold, polls until ready | ~15 s |
+| `stage3_knee.sh` | none | sweeps arrival rate 4-14 under `least_conn` to find the knee | ~25 min |
+| `stage4_theta.sh` | rate | sweeps the `theta` parameter at one rate, with `least_conn` as reference | ~30 min |
+| `stage5_compare.sh` | env: `RATES`, `POLICIES`, `REPEATS` | every policy at every rate, with repeats | ~30 min per rate |
+| `stage6_competitors.sh` | rate (default 10) | benchmarks against sgl-router | ~90 min |
+| `start_competitor_router.sh` | policy, port | launches one sgl-router instance | ~25 s |
 
-`stage4_theta.sh` takes a rate as its argument and sweeps the `theta` parameter at that
-rate, with `least_conn` included as a fixed reference line.
+All of them restart the backends cold before every arm, so runs are independent.
 
-`stage5_compare.sh` runs every policy at several rates and prints the comparison table.
-
-Redirect output to a file rather than watching it in a terminal, because terminal
-rendering is slow enough to interfere with the event loop.
+Redirect output to a file rather than watching it in a terminal, because terminal rendering
+is slow enough to interfere with the event loop. `tee` gets you both, and the log is required
+input for `occupancy_stats.py`:
 
 ```bash
-./stage3_knee.sh > knee.log 2>&1 &
-tail -f knee.log
+./stage3_knee.sh 2>&1 | tee results_knee/sweep_log.txt
 ```
+
+To run something long in the background and watch it:
+
+```bash
+./stage5_compare.sh > results_compare/compare_log.txt 2>&1 &
+tail -f results_compare/compare_log.txt
+```
+
+### Running one measurement by hand
+
+Everything the scripts do reduces to this:
+
+```bash
+./restart_sims.sh 64
+
+./venv/bin/python loadgen.py \
+  --trace tr_v2_r10.json \
+  --backends http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004 \
+  --out results/r10_pressure.csv \
+  --policy pressure \
+  --max-num-seqs 64 \
+  --kv-model prompt_only \
+  --theta 0.55 --sigma 0.95 \
+  --seed 1
+```
+
+Watch a run live from a second terminal:
+
+```bash
+for i in 1 2 3 4; do echo -n "sim$i: "; curl -s http://localhost:800$i/metrics | grep '^vllm:kv_cache_usage_perc'; done
+```
+
+Comparing that against the `occupancy[...]` figures in the run's own status line is how the
+router's memory model was validated against reality. The two should track within a few
+percent. If they do not, the router is routing on a fiction and nothing downstream is valid.
 
 ## Reading the results
 
@@ -364,7 +559,6 @@ stage4_theta.sh           tune the pressure threshold at a given rate
 stage5_compare.sh         compare all policies across several rates
 stage6_competitors.sh     compare against sgl-router
 
-BUGFIX_TRACKER.md         open defects and the state of the current fix cycle
 ```
 
 Traces, result CSVs and logs are generated artifacts and are not tracked.

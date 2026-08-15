@@ -24,24 +24,41 @@ and the approach works before committing to an implementation.
 
 ### What Phase 0 measured
 
-Running variable-length LLM traffic through four backends with standard least-connections
-routing, then comparing against Keel's pressure-based policy on byte-identical traffic:
+Variable-length LLM traffic through four backends, byte-identical traces, three repeats per
+cell, cold backends before every run. Errors are requests rejected because a backend ran out
+of KV cache memory.
 
-| arrival rate | least-connections error rate | Keel error rate | reduction |
+| arrival rate | least-connections | Keel `pressure` | reduction |
 |---|---|---|---|
-| 4 req/s | 15.8% | 4.3% | 73% |
-| 6 req/s | 17.1% | 12.5% | 27% |
-| 8 req/s | 29.1% | 19.7% | 32% |
+| 8 req/s | 2.0% | **0.3%** | 6.7x |
+| 10 req/s | 3.5% | **0.9%** | 3.9x |
+| 12 req/s | 6.1% | **1.9%** | 3.2x |
+| 14 req/s | 10.8% | **3.3%** | 3.3x |
 
-Errors here are requests rejected because a backend ran out of KV cache memory.
+Against a real LLM-aware competitor, SGLang's production Rust router, at 10 req/s:
 
-The mechanism behind the improvement was confirmed rather than assumed. KV memory is
-allocated from prompt length, and under least-connections the distribution of prompt tokens
-across backends was 25.8% imbalanced while output tokens looked almost perfectly balanced at
-1.9%. Rejections tracked prompt-token load in exact order. Keel's policy cut that imbalance
-to 6.9%, and the error rate fell in step.
+| router | policy | error rate |
+|---|---|---|
+| **Keel** | **pressure** | **1.03%** |
+| Keel | least_conn | 4.60% |
+| sgl-router | cache_aware | 4.97% |
+| sgl-router | power_of_two | 5.10% |
 
-Full write-up in [`journey/phase-0.md`](journey/phase-0.md).
+The run-to-run ranges do not overlap: Keel spans 0.9-1.2% while the best single run any
+competitor produced was 2.3%.
+
+The mechanism was confirmed rather than assumed, and it is not the one originally expected.
+Keel does **not** balance total load more evenly. It balances load *at each moment*.
+sgl-router's `cache_aware` distributes cumulative KV load about eight times more evenly than
+Keel does, and still fails nearly five times as often. What predicts failure is time spent
+at the capacity ceiling: under least-connections some backend sits at or above it for 35-42%
+of the run at higher rates, which Keel cuts to 15-24%.
+
+> Spreading total work evenly across backends is not the same as preventing any backend from
+> overflowing, and optimising the former can leave the latter completely untouched.
+
+Full write-up, including the three measurement corrections that changed these numbers, in
+[`journey/phase-0.md`](journey/phase-0.md).
 
 ### What is not yet established
 
@@ -50,8 +67,16 @@ requests when KV memory runs out, whereas real vLLM preempts and recomputes. Whe
 improvement transfers is untested. Stage 0b repeats the same traces against real vLLM on a
 GPU to close that gap.
 
-The comparison is also against least-connections, which is what nginx and HAProxy do. It is
-not yet a comparison against LLM-aware routers such as llm-d, AIBrix, or NVIDIA Dynamo.
+The simulator also does not grow KV memory during generation, which real vLLM does. That
+means the stronger form of the thesis, that *unpredictable output length* is the hidden cost,
+is not testable on this harness. What is validated is that per-request cost varies by orders
+of magnitude and is invisible to a request-counting router.
+
+The trace contains no shared prefixes, which is the regime needed to make the memory limit
+bind. `cache_aware`'s actual mechanism therefore has nothing to exploit, so the comparison
+above is a fair test of KV discipline and not of cache-aware routing.
+
+The comparison does not yet include llm-d, AIBrix, or NVIDIA Dynamo.
 
 ## Repository layout
 

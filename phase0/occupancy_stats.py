@@ -17,7 +17,8 @@ letting any single backend peak.
 So the mechanism claim has to be tested on instantaneous state. The ticker in
 loadgen.py already prints per-backend occupancy every 5 seconds, and that estimate
 was verified against the backends' real kv_cache_usage_perc (see kv_curve.py and
-the B1-check in BUGFIX_TRACKER.md), so the log is a usable sample of it.
+the memory-model correction in ../journey/phase-0.md section 7), so the log is
+a usable sample of it.
 
 What this reports, per (rate, policy):
 
@@ -37,7 +38,12 @@ import collections
 import re
 import statistics
 
+# stage5_compare.sh: "### rate=8  policy=pressure  run=1/3"
 HEADER = re.compile(r"###\s+rate=([\d.]+)\s+policy=(\S+)\s+run=(\d+)")
+# stage6_competitors.sh: "--- ours:pressure  run=1/3 ---". No rate in the header,
+# so it is taken from the trace/stage banner elsewhere in the log.
+HEADER_ARM = re.compile(r"---\s+(\S+?)\s+run=(\d+)/")
+ANY_RATE = re.compile(r"rate=([\d.]+)")
 TICK = re.compile(r"occupancy\[([^\]]*)\]")
 
 
@@ -45,11 +51,21 @@ def parse(path):
     """Return {(rate, policy): [ [occ per backend] per tick ]}."""
     groups = collections.defaultdict(list)
     key = None
+    fallback_rate = "?"
     for line in open(path, errors="replace"):
         h = HEADER.search(line)
         if h:
             key = (h.group(1), h.group(2))
             continue
+        h = HEADER_ARM.search(line)
+        if h:
+            key = (fallback_rate, h.group(1))
+            continue
+        # Any "rate=N" outside a header (e.g. the stage banner) seeds the rate for
+        # log formats that do not carry it per arm.
+        r = ANY_RATE.search(line)
+        if r and "occupancy[" not in line:
+            fallback_rate = r.group(1)
         if key is None:
             continue
         t = TICK.search(line)
@@ -95,7 +111,13 @@ def main():
     print("-" * 92)
 
     last_rate = None
-    for (rate, policy) in sorted(groups, key=lambda k: (float(k[0]), k[1])):
+    def sort_key(k):
+        try:
+            return (float(k[0]), k[1])
+        except ValueError:
+            return (float("inf"), k[1])   # unknown rate sorts last
+
+    for (rate, policy) in sorted(groups, key=sort_key):
         ticks = groups[(rate, policy)]
         if last_rate is not None and rate != last_rate:
             print()

@@ -60,6 +60,6 @@ done
 echo ""
 echo "============================================"
 echo "STAGE 3 COMPLETE - find where p99 jumps"
-echo "  Record the knee rate in BUGFIX_TRACKER.md (task C1)."
+echo "  Record the knee rate before running the comparison stages."
 echo "============================================"
 $PY compare.py results_knee/*.csv
