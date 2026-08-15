@@ -178,27 +178,56 @@ def summarize(trace, mode):
               f"({decoupled/len(trace)*100:.0f}%)")
 
     # Rough capacity note: helps pick rates for the knee sweep.
+    #
+    # LENGTH-BIASED SAMPLING (the inspection paradox). An earlier version of this
+    # estimate divided KV capacity by the MEAN request length and concluded ~32
+    # concurrent per backend. Measured reality was 13-15 before KV exhaustion.
+    #
+    # The mean is the wrong statistic. A request holds its KV for a time
+    # proportional to its length (output == prompt, 20ms per token), so long
+    # requests linger. At any instant the in-flight population is therefore biased
+    # toward long requests: a 2000-token request is present ~15x longer than a
+    # 130-token one, so it is ~15x more likely to be there when you look.
+    #
+    # Time-averaged KV per backend = (lambda/B) * ITL * F * E[L^2], because each
+    # request holds L tokens for a time proportional to L. So the length that
+    # matters is E[L^2]/E[L], not E[L]. For a heavy tail these differ by 3x+.
     mean_out = total_out / len(outs)  # tokens actually generated per request
     svc = mean_out * 0.020            # inter-token-latency 20ms, unloaded
     # Backends slow down as they fill (--time-factor-under-load), so service
     # time inflates with utilisation and effective capacity DROPS. Solving
     # u = lam*svc*(1+(F-1)*u)/S for u=1 gives the true saturation rate.
-    # KV held per request = prompt + everything generated. In echo mode the
-    # generated part equals the prompt, so this is 2 x prompt. An earlier version
-    # of this estimate used prompt only, overstating capacity by ~2x and sending
-    # every sweep far past saturation.
-    mean_kv = (total_p + total_out) / len(outs)
-    KV_PER_BACKEND, BACKENDS, F = 8192.0, 4, 2.5
-    kv_slots = KV_PER_BACKEND / mean_kv           # concurrent requests before KV exhaustion
+    # KV held per request. MEASURED against llm-d-inference-sim (kv_curve.py,
+    # 2026-08-15): the simulator allocates the PROMPT's blocks at admission and
+    # holds them flat for the whole request. Generated tokens cost it no extra KV.
+    # So mean_kv is the mean PROMPT, not prompt+output.
+    #
+    # A previous version of this estimate used prompt+output on the belief that
+    # echoed tokens consume KV. They do not here, and that halved the capacity
+    # estimate. On real vLLM the prompt+output form IS correct -- switch when
+    # stage 0b runs against real hardware.
+    mean_kv = total_p / len(prompts)
+    KV_PER_BACKEND, BACKENDS, F, ITL = 8192.0, 4, 2.5, 0.020
+
+    # Empirical first and second moments of the held length.
+    e_l = mean_kv
+    e_l2 = sum(x * x for x in prompts) / len(prompts)
+    biased = e_l2 / e_l if e_l > 0 else 0.0   # E[L^2]/E[L]: what an in-flight request costs
+
+    # Saturation: (lambda/B) * ITL * F * E[L^2] = KV_PER_BACKEND
+    lam_sat = (BACKENDS * KV_PER_BACKEND) / (ITL * F * e_l2) if e_l2 > 0 else 0.0
+    kv_slots = KV_PER_BACKEND / biased if biased > 0 else 0.0
     S = kv_slots * BACKENDS
-    lam_sat = S / (svc * F)
+
     shared = sum(1 for r in trace if r.get("_shared"))
     print(f"  shared-prefix requests: {shared} ({shared/len(trace)*100:.0f}%)")
-    print(f"  mean KV held/request  : {mean_kv:.0f} tokens "
-          f"=> ~{kv_slots:.1f} concurrent per backend before KV exhaustion")
+    print(f"  mean length           : {e_l:.0f} tokens")
+    print(f"  length-biased mean    : {biased:.0f} tokens  <- what an IN-FLIGHT request "
+          f"actually costs ({biased/e_l:.1f}x the mean)")
+    print(f"  => ~{kv_slots:.1f} concurrent per backend before KV exhaustion")
     print(f"  mean service time     : ~{svc:.1f}s unloaded, ~{svc*F:.1f}s saturated")
     print(f"  => KV-bound capacity ~{S:.0f} concurrent; saturation near {lam_sat:.1f} req/s")
-    print(f"  => sweep rates around {lam_sat*0.5:.1f} - {lam_sat*1.3:.1f}")
+    print(f"  => sweep rates around {lam_sat*0.5:.1f} - {lam_sat*2.0:.1f}")
 
 
 if __name__ == "__main__":
@@ -238,6 +267,21 @@ if __name__ == "__main__":
     ap.add_argument("--uniform-output", type=int, default=100)
 
     a = ap.parse_args()
+
+    # In echo mode there is exactly ONE length per request and it is drawn from
+    # the --out-* distribution, so the --prompt-* flags do nothing. Silently
+    # ignoring them would let someone "tune the prompt distribution" for an hour
+    # and see no effect.
+    if a.backend_mode == "echo" and a.kind == "lognormal":
+        defaults = {"prompt_median": 200.0, "prompt_sigma": 1.0,
+                    "prompt_min": 20, "prompt_max": 4000}
+        overridden = [k for k, v in defaults.items() if getattr(a, k) != v]
+        if overridden:
+            print(f"WARNING: --backend-mode=echo draws ONE length from the --out-* "
+                  f"distribution.\n         These flags are ignored: "
+                  f"{', '.join('--' + k.replace('_', '-') for k in overridden)}\n"
+                  f"         Use --out-median / --out-sigma to change the length "
+                  f"distribution.")
 
     trace = generate_trace(a.kind, a.num_requests, a.rate, a.seed, a)
     with open(a.out, "w") as f:

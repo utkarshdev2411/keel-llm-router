@@ -20,6 +20,28 @@ def kvts_remaining(p, h, c, o_hat):
     return rem * (p - h + c + rem / 2.0)
 
 
+def kv_for(p, o_hat, kv_model):
+    """Projected peak KV tokens held by one request.
+
+    prompt_only
+        llm-d-inference-sim. MEASURED (kv_curve.py, 2026-08-15): the simulator
+        allocates the prompt's blocks at admission, holds them FLAT for the whole
+        request, and frees them at completion. It does not grow KV as tokens are
+        generated. A 1000-word prompt generating 1000 tokens over 20.4s sat at a
+        constant 0.1211 usage = 992 tokens = 62 blocks x 16 = the prompt alone.
+
+    prompt_plus_output
+        Real vLLM. Every generated token appends a KV entry, so peak is
+        prompt + output. Physically correct, and what stage 0b must use.
+
+    These differ by ~2x, so getting it wrong breaks the admission gate in one
+    direction or the other. An earlier version hardcoded prompt+output on the
+    belief that echoed tokens consume KV here; they do not, and it made the
+    router read 2.02x high against this simulator.
+    """
+    return p + o_hat if kv_model == "prompt_plus_output" else p
+
+
 def occupancy(state, b):
     """Fraction of this backend's binding capacity that is committed.
 
@@ -115,11 +137,9 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
         "stream": True,
     }
     charged = charged0        # kvts debt (kvts arms only)
-    # Projected peak KV for this request: the prompt, plus everything it will
-    # generate. Both terms always count -- an earlier version projected the
-    # prompt alone, which undercounted by exactly 2.0x against this simulator
-    # and left the router believing backends were half as full as they were.
-    kv_held = p + o_hat0
+    # Projected peak KV for this request. What counts depends on whether the
+    # backend grows KV during decode -- see kv_for().
+    kv_held = kv_for(p, o_hat0, state["kv_model"])
     o_hat = o_hat0
     c = 0
     first_tok = None
@@ -164,7 +184,9 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
                 # `>=` would fire a spurious recharge on every request.
                 if c > o_hat:
                     o_hat += 50
-                    new_kv = p + o_hat
+                    # Under kv_model=prompt_only this is a no-op delta of 0, which
+                    # is correct: the backend's KV does not grow with output there.
+                    new_kv = kv_for(p, o_hat, state["kv_model"])
                     state["kv_proj"][backend] += (new_kv - kv_held)
                     kv_held = new_kv
 
@@ -177,7 +199,9 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
     finally:
         state["in_flight"][backend] -= 1
         state["kv_proj"][backend] -= kv_held
-        if state["kv_proj"][backend] < 1e-9:
+        # Clamp only genuine negatives from float drift. The old `< 1e-9` test also
+        # zeroed small POSITIVE residuals, silently discarding real held KV.
+        if state["kv_proj"][backend] < 0:
             state["kv_proj"][backend] = 0.0
         if policy.startswith("kvts"):
             state["W"][backend] -= charged
@@ -200,19 +224,31 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
     results.append({
         "req_id": req_id, "backend": backend, "scheduled_offset_s": sched_s,
         "ttft_s": ttft, "e2e_s": t1 - t0,
-        "requested_max_tokens": req["max_tokens"], "actual_tokens": c, "error": err,
+        "requested_max_tokens": req["max_tokens"],
+        # prompt_tokens is the KV cost this request imposed, and it is recorded
+        # for EVERY row including rejections. Without it, imbalance can only be
+        # measured over successes, which flatters whichever policy sheds most
+        # (tracker B4).
+        "prompt_tokens": p,
+        "actual_tokens": c, "error": err,
     })
 
 
-async def ticker(state, prog, stop):
+async def ticker(state, prog, stop, policy):
     while not stop.is_set():
         await asyncio.sleep(5)
         if stop.is_set():
             break
         inf = " ".join(f"{b[-4:]}={v}" for b, v in state["in_flight"].items())
-        occ = " ".join(f"{b[-4:]}={occupancy(state, b):.2f}" for b in state["in_flight"])
-        print(f"  -- disp={prog['disp']}/{prog['total']} done={prog['done']}/{prog['total']}"
-              f" | inflight[{inf}] | occupancy[{occ}]", flush=True)
+        line = (f"  -- disp={prog['disp']}/{prog['total']} "
+                f"done={prog['done']}/{prog['total']} | inflight[{inf}]")
+        # Under proxy the only "backend" is the external router, so kv_proj tracks
+        # nothing real and the occupancy figure is meaningless. Printing it invited
+        # reading it as though it described the backends behind the router.
+        if policy != "proxy":
+            occ = " ".join(f"{b[-4:]}={occupancy(state, b):.2f}" for b in state["in_flight"])
+            line += f" | occupancy[{occ}]"
+        print(line, flush=True)
 
 
 async def run(trace_path, backends, out_path, policy, cfg):
@@ -231,11 +267,12 @@ async def run(trace_path, backends, out_path, policy, cfg):
         "sigma": cfg["sigma"],
         "verbose": cfg["verbose"],
         "output_model": cfg["output_model"],
+        "kv_model": cfg["kv_model"],
     }
     prog = {"total": len(trace), "disp": 0, "done": 0}
     stop = asyncio.Event()
     start = time.monotonic()
-    tick = asyncio.create_task(ticker(state, prog, stop))
+    tick = asyncio.create_task(ticker(state, prog, stop, policy))
     lagged = 0
     gated = 0
 
@@ -260,7 +297,7 @@ async def run(trace_path, backends, out_path, policy, cfg):
             #   max_tokens - real vLLM stops at max_tokens or EOS, whichever first,
             #                so max_tokens is a true upper bound. Use for stage 0b.
             o_hat = p if cfg["output_model"] == "echo" else req["max_tokens"]
-            kv_new = p + o_hat
+            kv_new = kv_for(p, o_hat, cfg["kv_model"])
             charge = kvts_remaining(p, 0, 0, o_hat) if policy.startswith("kvts") else 0.0
 
             if policy.startswith("pressure"):
@@ -295,7 +332,7 @@ async def run(trace_path, backends, out_path, policy, cfg):
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["req_id", "backend", "scheduled_offset_s",
                                           "ttft_s", "e2e_s", "requested_max_tokens",
-                                          "actual_tokens", "error"])
+                                          "prompt_tokens", "actual_tokens", "error"])
         w.writeheader()
         for r in sorted(results, key=lambda x: x["req_id"]):
             w.writerow(r)
@@ -312,7 +349,11 @@ if __name__ == "__main__":
                     choices=["least_conn", "kvts", "kvts_p2c", "pressure", "pressure_p2c",
                              "proxy"])
     # must match the simulator's flags
-    ap.add_argument("--max-num-seqs", type=int, default=8)
+    ap.add_argument("--max-num-seqs", type=int, default=32)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds tie-breaking in least_conn/pressure and p2c sampling. "
+                         "Without it, run-to-run variance is unquantified and two runs of "
+                         "the same trace are not comparable (tracker B5).")
     ap.add_argument("--kv-capacity", type=int, default=8192)  # kv-cache-size 512 x block-size 16
     # scoring knobs
     ap.add_argument("--theta", type=float, default=0.70)   # knee: penalty starts here
@@ -324,10 +365,19 @@ if __name__ == "__main__":
                          "llm-d-inference-sim --mode echo, which replays the prompt and "
                          "ignores max_tokens, so output == prompt. 'max_tokens' matches "
                          "real vLLM, which caps at max_tokens; use it for stage 0b.")
+    ap.add_argument("--kv-model", default="prompt_only",
+                    choices=["prompt_only", "prompt_plus_output"],
+                    help="does the backend grow KV as it generates? 'prompt_only' "
+                         "(default) matches llm-d-inference-sim, MEASURED to hold only "
+                         "the prompt's blocks flat for the whole request (see "
+                         "kv_curve.py). 'prompt_plus_output' matches real vLLM, where "
+                         "every generated token appends to the KV cache; use it for "
+                         "stage 0b. These differ by ~2x.")
     ap.add_argument("--verbose", action="store_true",
                     help="log every completed request. OFF by default: print() "
                          "blocks the event loop and inflates measured TTFT.")
     a = ap.parse_args()
+    random.seed(a.seed)
 
     cfg = {
         "max_num_seqs": a.max_num_seqs,
@@ -337,5 +387,6 @@ if __name__ == "__main__":
         "sigma": a.sigma,
         "verbose": a.verbose,
         "output_model": a.output_model,
+        "kv_model": a.kv_model,
     }
     asyncio.run(run(a.trace, a.backends.split(","), a.out, a.policy, cfg))

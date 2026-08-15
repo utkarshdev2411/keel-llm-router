@@ -45,6 +45,31 @@ def summarize(path, trim):
     ok = [r for r in rows if not r["error"]]
     ttfts = [float(r["ttft_s"]) for r in ok if r["ttft_s"]]
 
+    # TWO spreads, deliberately (tracker B4).
+    #
+    # DISPATCH spread covers every row, rejections included, and uses prompt
+    # tokens -- the KV each request asked the backend to hold. This answers "did
+    # the router balance the load it handed out?"
+    #
+    # COMPLETION spread covers successes only. This answers "what actually got
+    # served?"
+    #
+    # Reporting only the second is a trap: a backend that receives heavy traffic
+    # and rejects most of it registers as lightly loaded, so a policy that sheds
+    # aggressively scores as well balanced. Error rates at the knee are 3-11%, and
+    # `pressure`'s whole mechanism is refusing admission, so this bias points
+    # straight at our own conclusion.
+    disp = {}
+    for r in rows:
+        b = r["backend"]
+        disp.setdefault(b, {"n": 0, "kv": 0})
+        disp[b]["n"] += 1
+        # prompt_tokens is absent in CSVs written before 2026-08-15.
+        if r.get("prompt_tokens"):
+            disp[b]["kv"] += int(r["prompt_tokens"])
+
+    has_prompt_tokens = any(r.get("prompt_tokens") for r in rows)
+
     by_backend = {}
     for r in ok:
         b = r["backend"]
@@ -66,6 +91,9 @@ def summarize(path, trim):
         "p50": pct(ttfts, 0.50),
         "p95": pct(ttfts, 0.95),
         "p99": pct(ttfts, 0.99),
+        "disp_req_spread": spread([v["n"] for v in disp.values()]),
+        "disp_kv_spread": (spread([v["kv"] for v in disp.values()])
+                           if has_prompt_tokens else None),
         "req_spread": spread([v["n"] for v in by_backend.values()]),
         "tok_spread": spread([v["tok"] for v in by_backend.values()]),
     }
@@ -92,18 +120,20 @@ if __name__ == "__main__":
     print(f"warmup/drain trim: {a.trim:.0%} at each end "
           f"(~{kept}/{raw} requests kept per run)")
     print()
-    print(f"{'rate':>6} {'policy':<14} {'n':>5} {'err':>5} {'err%':>6} "
-          f"{'TTFT p50':>10} {'p95':>10} {'p99':>10} {'req sprd':>9} {'tok sprd':>9}")
-    print("-" * 99)
+    print(f"{'rate':>6} {'policy':<22} {'n':>5} {'err':>5} {'err%':>6} "
+          f"{'TTFT p50':>10} {'p95':>10} {'p99':>10} "
+          f"{'DISP req':>9} {'DISP kv':>9} {'ok tok':>9}")
+    print("-" * 127)
 
     last = None
     for r in rows:
         if last is not None and r["rate"] != last:
             print()
-        print(f"{r['rate']:>6} {r['policy']:<14} {r['n']:>5} {r['errors']:>5} "
+        kv = "n/a" if r["disp_kv_spread"] is None else f"{r['disp_kv_spread']:.1f}%"
+        print(f"{r['rate']:>6} {r['policy']:<22} {r['n']:>5} {r['errors']:>5} "
               f"{r['err_pct']:>5.1f}% "
               f"{fmt_ms(r['p50']):>10} {fmt_ms(r['p95']):>10} {fmt_ms(r['p99']):>10} "
-              f"{r['req_spread']:>8.1f}% {r['tok_spread']:>8.1f}%")
+              f"{r['disp_req_spread']:>8.1f}% {kv:>9} {r['tok_spread']:>8.1f}%")
         last = r["rate"]
 
     print()
@@ -116,6 +146,13 @@ if __name__ == "__main__":
     print("  4. err%    : KV exhaustion -> HTTP 500 in this simulator. This is the")
     print("               PRIMARY signal. Rejected requests have no TTFT, so a policy")
     print("               that sheds load can look artificially fast. Read err% FIRST.")
-    print("  5. tok sprd: the direct measure of the imbalance being fixed.")
-    print("               Low tok spread + high req spread = working as intended.")
+    print("  5. DISP kv : THE headline metric. Spread of prompt tokens dispatched per")
+    print("               backend, over ALL requests including rejections. This is the")
+    print("               imbalance the project exists to fix. Lower is better.")
+    print("  6. DISP req: spread of request COUNTS dispatched. least_conn drives this")
+    print("               toward 0 by construction. High DISP req + low DISP kv is the")
+    print("               signature of working as intended: uneven counts, even load.")
+    print("  7. ok tok  : served tokens, successes only. Kept for continuity, but do")
+    print("               NOT read it as balance -- a backend that rejects most of its")
+    print("               traffic looks lightly loaded here. That is why DISP kv exists.")
     print()

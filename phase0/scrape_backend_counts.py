@@ -15,8 +15,11 @@ import urllib.request
 
 def scrape(url):
     text = urllib.request.urlopen(url, timeout=5).read().decode()
-    reqs = re.search(r'^vllm:e2e_request_latency_seconds_count\{[^}]*\}\s+([\d.eE+]+)', text, re.M)
-    toks = re.search(r'^vllm:prompt_tokens_total\{[^}]*\}\s+([\d.eE+]+)', text, re.M)
+    # Label block is optional: an exporter may emit the metric bare, and
+    # requiring `{...}` would silently return None for every backend, making a
+    # run look like it produced no traffic at all.
+    reqs = re.search(r'^vllm:e2e_request_latency_seconds_count(?:\{[^}]*\})?\s+([\d.eE+]+)', text, re.M)
+    toks = re.search(r'^vllm:prompt_tokens_total(?:\{[^}]*\})?\s+([\d.eE+]+)', text, re.M)
     return {
         "requests": float(reqs.group(1)) if reqs else None,
         "prompt_tokens": float(toks.group(1)) if toks else None,
