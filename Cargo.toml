@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/router-core",
+    "crates/router-proxy",
+    "crates/router-bin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "TBD"
+
+[workspace.dependencies]
+# Shared versions across crates. Individual crates opt in via `dep.workspace = true`.
+tokio = { version = "1.53", features = ["full"] }
+hyper = { version = "1.11", features = ["full"] }
+hyper-util = "0.1"
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+arc-swap = "1.7"
+rand = "0.8"
+smallvec = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
