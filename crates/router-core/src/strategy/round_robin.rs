@@ -32,15 +32,18 @@ impl RoutingStrategy for RoundRobin {
     fn pick(
         &self,
         snap: &Snapshot,
-        _req: &RequestFeatures,
+        req: &RequestFeatures,
         _rng: &mut SmallRng,
-        _trace: Option<&mut DecisionTrace>,
+        trace: Option<&mut DecisionTrace>,
     ) -> Option<BackendId> {
         if snap.healthy.is_empty() {
+            crate::trace::record_pick(trace, self.name(), snap, req, None);
             return None;
         }
         let i = self.next.fetch_add(1, Relaxed) % snap.healthy.len();
-        Some(snap.healthy[i])
+        let picked = Some(snap.healthy[i]);
+        crate::trace::record_pick(trace, self.name(), snap, req, picked);
+        picked
     }
 }
 

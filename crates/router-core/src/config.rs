@@ -36,6 +36,8 @@ pub struct RawRouting {
     pub penalty: f64,
     #[serde(default)]
     pub kv_model: Option<KvModel>,
+    #[serde(default = "default_trace_sample_rate")]
+    pub decision_trace_sample_rate: f64,
 }
 
 fn default_strategy() -> String {
@@ -47,6 +49,9 @@ fn default_theta() -> f64 {
 fn default_penalty() -> f64 {
     DEFAULT_PENALTY
 }
+fn default_trace_sample_rate() -> f64 {
+    0.01
+}
 
 impl Default for RawRouting {
     fn default() -> Self {
@@ -55,6 +60,7 @@ impl Default for RawRouting {
             theta: default_theta(),
             penalty: default_penalty(),
             kv_model: None,
+            decision_trace_sample_rate: default_trace_sample_rate(),
         }
     }
 }
@@ -98,6 +104,7 @@ pub struct Config {
     pub penalty: f64,
     pub sigma: f64,
     pub kv_model: KvModel,
+    pub decision_trace_sample_rate: f64,
     pub backends: Vec<RawBackend>,
 }
 
@@ -151,6 +158,7 @@ impl RawConfig {
             penalty: self.routing.penalty,
             sigma: self.admission.sigma,
             kv_model: self.routing.kv_model.unwrap_or(KvModel::PromptOnly),
+            decision_trace_sample_rate: self.routing.decision_trace_sample_rate,
             backends: self.backends,
         })
     }

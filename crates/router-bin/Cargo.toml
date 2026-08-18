@@ -14,6 +14,7 @@ router-proxy = { path = "../router-proxy" }
 tokio = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
+arc-swap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
