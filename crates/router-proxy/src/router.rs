@@ -80,6 +80,11 @@ async fn handle_inner(
         );
     }
 
+    // NFR-3: parse + tokenize + decide, stopping here, before any upstream
+    // network time is incurred. This is the number the Phase 1 exit
+    // criterion's "router overhead p99 < 1ms" is checked against.
+    observe::record_router_overhead(now.elapsed().as_secs_f64());
+
     let backend = snap.backends[backend_id.0 as usize].clone();
     backend.live.inflight.fetch_add(1, Relaxed);
     observe::record_inflight(&backend.key, backend.live.inflight.load(Relaxed));

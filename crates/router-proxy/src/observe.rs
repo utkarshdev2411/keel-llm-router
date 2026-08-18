@@ -34,6 +34,12 @@ pub fn describe_metrics() {
     metrics::describe_gauge!("router_backend_inflight", "In-flight requests, per backend.");
     metrics::describe_histogram!("router_decision_duration_seconds", "Time spent in the routing decision, per strategy.");
     metrics::describe_histogram!("router_inbound_duration_seconds", "Time spent parsing and building request features.");
+    metrics::describe_histogram!(
+        "router_overhead_seconds",
+        "End-to-end router cost per request: body parse + feature extraction + routing \
+         decision, measured up to the moment the upstream request is dispatched. Excludes \
+         upstream network and generation time. This is NFR-3's p99 < 1ms budget."
+    );
 }
 
 pub fn record_request_result(ok: bool) {
@@ -52,4 +58,8 @@ pub fn record_inflight(backend_key: &str, n: u32) {
 
 pub fn record_decision_duration(strategy: &str, seconds: f64) {
     metrics::histogram!("router_decision_duration_seconds", "strategy" => strategy.to_string()).record(seconds);
+}
+
+pub fn record_router_overhead(seconds: f64) {
+    metrics::histogram!("router_overhead_seconds").record(seconds);
 }
