@@ -3,10 +3,13 @@ use std::net::SocketAddr;
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub fn init_tracing() {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Default to `info` when RUST_LOG is unset. With a bare
+    // EnvFilter::from_default_env() the process starts up completely silent,
+    // which makes "did the router actually bind?" unanswerable without
+    // reaching for `ss`.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().json().with_env_filter(filter).init();
 }
 
 /// Installs the global Prometheus recorder, serving `/metrics` on

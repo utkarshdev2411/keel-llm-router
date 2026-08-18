@@ -91,29 +91,49 @@ cd "$(git rev-parse --show-toplevel)/phase0" && mkdir -p results_router_check &&
     --policy least_conn --max-num-seqs 64 --seed 1
 ```
 
-**4. Restart the backends cold** — this removes any cache-warming confound left over from
+**4a. Restart the backends cold** — this removes any cache-warming confound left over from
 step 3:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/phase0" && ./restart_sims.sh 64
 ```
 
-**Then start our router in front of them, in release mode** (a debug build's overhead
-numbers are not representative). This one is deliberately from the repository root, not
-`phase0/`, since it builds and runs the Rust workspace:
+**4b. Build the router in release mode.** Run this in the foreground and let it finish. A
+debug build's overhead numbers are not representative, and a cold release build takes on the
+order of a minute — which is exactly long enough to lose a race against the next step if you
+background it.
 
 ```bash
-cd "$(git rev-parse --show-toplevel)" && cargo build --workspace --release && ./target/release/router bench/configs/router/least_requests.toml &
-sleep 2
+cd "$(git rev-parse --show-toplevel)" && cargo build --workspace --release
 ```
 
-**5. Drive the identical trace through our router via `--policy proxy`:**
+**4c. Start the router, then wait until it actually answers** before proceeding. Do not
+substitute a fixed `sleep` here: if the router is not listening yet, every request in step 5
+fails with `All connection attempts failed` and the run is wasted.
+
+```bash
+cd "$(git rev-parse --show-toplevel)" && ./target/release/router bench/configs/router/least_requests.toml > /tmp/router.log 2>&1 &
+for i in $(seq 1 30); do
+  curl -s --max-time 1 -o /dev/null "http://127.0.0.1:8080/v1/models" && break
+  sleep 1
+done
+ss -ltn | grep -q ':8080' && echo "router is listening" || { echo "ROUTER DID NOT START — see /tmp/router.log"; tail -20 /tmp/router.log; }
+```
+
+The router logs as JSON to stdout, captured above in `/tmp/router.log`. You should see a
+`"listening"` line with `"bind":"0.0.0.0:8080"`. If you want request-level detail, prefix the
+command with `RUST_LOG=debug`.
+
+**5. Drive the identical trace through our router via `--policy proxy`.** Note the output
+filename contains `proxy`: `verify.py` skips its per-backend coverage check for such runs,
+because in proxy mode the load generator only ever sees the single router URL and would
+otherwise report a false failure.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/phase0" && ./venv/bin/python loadgen.py \
     --trace tr_v2_r8.json \
     --backends "http://127.0.0.1:8080" \
-    --out results_router_check/r8_our_router_least_requests.csv \
+    --out results_router_check/r8_ourproxy_least_requests.csv \
     --policy proxy --max-num-seqs 64 --seed 1
 ```
 
@@ -146,7 +166,7 @@ cd "$(git rev-parse --show-toplevel)/phase0" && ./venv/bin/python verify.py resu
 
 | Check | Where | Pass condition |
 |---|---|---|
-| Error rate matches | step 8 table, `err%` column | `r8_reference_least_conn` and `r8_our_router_least_requests` agree within run-to-run variance |
+| Error rate matches | step 8 table, `err%` column | `r8_reference_least_conn` and `r8_ourproxy_least_requests` agree within run-to-run variance |
 | Dispatch counts match | step 8 table, `DISP req`/`DISP kv` columns | Same, within variance |
 | TTFT p99 consistent | step 8 table, `p99` column | Our router's p99 is in the same range as the reference's |
 | Router overhead < 1ms p99 | step 6 output | `router_overhead_seconds_bucket{le="0.001"}` divided by `router_overhead_seconds_count` is ≥ 0.99 |
