@@ -1,0 +1,61 @@
+static_resources:
+  listeners:
+    - name: listener_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                # Envoy streams by default and does not buffer the response
+                # body unless a buffer filter is explicitly added. None is
+                # added here — leaving one out is the correct, not the lazy,
+                # choice for this comparison.
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: backends
+                            timeout: 300s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: backends
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: LEAST_REQUEST
+      # choice_count: 2 makes LEAST_REQUEST into power-of-two-choices rather
+      # than a full scan over all hosts. This is Envoy's real default
+      # (choice_count defaults to 2), stated explicitly here so the setting
+      # survives a config diff rather than relying on an implicit default.
+      least_request_lb_config:
+        choice_count: 2
+      load_assignment:
+        cluster_name: backends
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8001 }
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8002 }
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8003 }
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8004 }
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }

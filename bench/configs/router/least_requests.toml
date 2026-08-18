@@ -1,0 +1,30 @@
+[listener]
+bind = "0.0.0.0:8080"
+admin_bind = "127.0.0.1:9090"
+
+[routing]
+strategy = "least_requests"
+
+[[backends]]
+url = "http://127.0.0.1:8001"
+model = "test-model"
+kv_tokens = 8192
+max_num_seqs = 64
+
+[[backends]]
+url = "http://127.0.0.1:8002"
+model = "test-model"
+kv_tokens = 8192
+max_num_seqs = 64
+
+[[backends]]
+url = "http://127.0.0.1:8003"
+model = "test-model"
+kv_tokens = 8192
+max_num_seqs = 64
+
+[[backends]]
+url = "http://127.0.0.1:8004"
+model = "test-model"
+kv_tokens = 8192
+max_num_seqs = 64
