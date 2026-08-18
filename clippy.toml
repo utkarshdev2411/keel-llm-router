@@ -1,0 +1,8 @@
+# Enforces the router-core purity boundary from the LLD §1: no tokio, no
+# wall-clock reads, anywhere in that crate. router-proxy and router-bin are
+# unaffected — this list only bites inside router-core because of its
+# `#![deny(clippy::disallowed_types)]` crate attribute.
+disallowed-types = [
+    { path = "std::time::SystemTime", reason = "non-monotonic; use std::time::Instant, passed in by the caller" },
+    { path = "tokio::time::Instant", reason = "router-core must not depend on tokio at all" },
+]
