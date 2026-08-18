@@ -85,9 +85,15 @@ mod tests {
         let max_num_seqs = 8u32;
         let kv_capacity = 8192u32;
 
-        let occ_a = (1.0 / max_num_seqs as f64).max(6000.0 / kv_capacity as f64);
-        let occ_b = (4.0 / max_num_seqs as f64).max(1000.0 / kv_capacity as f64);
+        // A: 1 long-generation request, 7 of 8 slots free, but that one
+        // request holds 1024 of the 8192 KV tokens.
+        let occ_a = (1.0 / max_num_seqs as f64).max(1024.0 / kv_capacity as f64);
+        // B: 4 short requests, 4 of 8 slots free, holding 4096 KV tokens
+        // combined -- fuller in the resource that actually runs out.
+        let occ_b = (4.0 / max_num_seqs as f64).max(4096.0 / kv_capacity as f64);
 
+        assert_eq!(occ_a, 0.125);
+        assert_eq!(occ_b, 0.5);
         assert!(occ_a < occ_b, "A should score as emptier: {occ_a} vs {occ_b}");
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "router-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "router"
+path = "src/main.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+router-proxy = { path = "../router-proxy" }
+tokio = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
