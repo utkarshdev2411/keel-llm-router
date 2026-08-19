@@ -1,5 +1,6 @@
 pub mod health;
 pub mod inbound;
+pub mod length_estimator;
 pub mod listener;
 pub mod observe;
 pub mod router;
