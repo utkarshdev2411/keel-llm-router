@@ -38,10 +38,14 @@ pub struct RawRouting {
     pub kv_model: Option<KvModel>,
     #[serde(default = "default_trace_sample_rate")]
     pub decision_trace_sample_rate: f64,
+    /// Half-life in seconds for the per-route output-length histogram (Phase 2).
+    #[serde(default = "default_route_p50_halflife_s")]
+    pub route_p50_halflife_s: f64,
 }
 
 fn default_strategy() -> String {
-    "least_requests".to_string()
+    // Phase 2: pressure is now the default shipping strategy.
+    "pressure".to_string()
 }
 fn default_theta() -> f64 {
     DEFAULT_THETA
@@ -52,6 +56,9 @@ fn default_penalty() -> f64 {
 fn default_trace_sample_rate() -> f64 {
     0.01
 }
+fn default_route_p50_halflife_s() -> f64 {
+    300.0 // 5 minutes, per algorithm spec §11
+}
 
 impl Default for RawRouting {
     fn default() -> Self {
@@ -61,6 +68,7 @@ impl Default for RawRouting {
             penalty: default_penalty(),
             kv_model: None,
             decision_trace_sample_rate: default_trace_sample_rate(),
+            route_p50_halflife_s: default_route_p50_halflife_s(),
         }
     }
 }
@@ -105,6 +113,7 @@ pub struct Config {
     pub sigma: f64,
     pub kv_model: KvModel,
     pub decision_trace_sample_rate: f64,
+    pub route_p50_halflife_s: f64,
     pub backends: Vec<RawBackend>,
 }
 
@@ -159,6 +168,7 @@ impl RawConfig {
             sigma: self.admission.sigma,
             kv_model: self.routing.kv_model.unwrap_or(KvModel::PromptOnly),
             decision_trace_sample_rate: self.routing.decision_trace_sample_rate,
+            route_p50_halflife_s: self.routing.route_p50_halflife_s,
             backends: self.backends,
         })
     }
@@ -196,5 +206,22 @@ mod tests {
     #[test]
     fn valid_config_passes() {
         assert!(raw(8192, 32).validate().is_ok());
+    }
+
+    #[test]
+    fn pressure_is_default_strategy() {
+        let cfg = raw(8192, 32).validate().unwrap();
+        assert_eq!(cfg.strategy, "pressure");
+    }
+
+    #[test]
+    fn sigma_out_of_range_rejected() {
+        let mut r = raw(8192, 32);
+        r.admission.sigma = 1.1;
+        assert!(matches!(r.validate(), Err(ConfigError::SigmaOutOfRange(_))));
+
+        let mut r2 = raw(8192, 32);
+        r2.admission.sigma = 0.0;
+        assert!(matches!(r2.validate(), Err(ConfigError::SigmaOutOfRange(_))));
     }
 }
