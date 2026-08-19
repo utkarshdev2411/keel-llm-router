@@ -47,6 +47,18 @@ pub fn describe_metrics() {
          Monotonic rise is a leak — the most expensive bug in this project."
     );
     metrics::describe_gauge!("router_backend_inflight", "In-flight requests per backend.");
+    metrics::describe_counter!(
+        "router_backend_occupancy_ticks_total",
+        "Occupancy samples taken for this backend by the periodic sampler. \
+         The denominator for the time-at-ceiling fraction."
+    );
+    metrics::describe_counter!(
+        "router_backend_ticks_at_ceiling_total",
+        "Samples where this backend's occupancy was at or above sigma. \
+         Divided by router_backend_occupancy_ticks_total this is the fraction of \
+         the run the backend spent in the region the admission gate exists to avoid. \
+         This is the mechanism half of the Phase 2 exit criterion."
+    );
 
     // --- Decision path timing ---
     metrics::describe_histogram!(
@@ -103,6 +115,25 @@ pub fn record_inflight(backend_key: &str, n: u32) {
 pub fn record_occupancy(backend_key: &str, occupancy: f64) {
     metrics::gauge!("router_backend_occupancy", "backend" => backend_key.to_string())
         .set(occupancy);
+}
+
+/// One occupancy sample from the periodic sampler. Always increments the
+/// denominator; increments the ceiling counter only when at or above sigma.
+/// Both must be counters, not gauges: the criterion is a fraction of the whole
+/// run, so the samples have to accumulate.
+pub fn record_occupancy_tick(backend_key: &str, at_ceiling: bool) {
+    metrics::counter!(
+        "router_backend_occupancy_ticks_total",
+        "backend" => backend_key.to_string()
+    )
+    .increment(1);
+    if at_ceiling {
+        metrics::counter!(
+            "router_backend_ticks_at_ceiling_total",
+            "backend" => backend_key.to_string()
+        )
+        .increment(1);
+    }
 }
 
 /// Phase 2: record kv_projected after each dispatch.

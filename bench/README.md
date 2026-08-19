@@ -174,3 +174,74 @@ cd "$(git rev-parse --show-toplevel)/phase0" && ./venv/bin/python verify.py resu
 
 If any of these disagree, do not trust the router's numbers yet — it is measuring a
 transport bug rather than being ready to carry a routing improvement on top.
+
+---
+
+## Comparing the capacity-aware policy against the baseline
+
+Once the router is trusted to carry traffic (the section above), the question becomes
+whether routing on occupancy actually beats routing on request count. Both arms run
+through the **same router binary**, so the extra network hop is identical and cancels
+out — the only thing that differs is the policy.
+
+What has to be true:
+
+| | Condition |
+|---|---|
+| **Error rate** | `pressure` at least 3x lower than `p2c` at the knee arrival rate |
+| **Mechanism** | `pressure` spends a lower fraction of the run at or above sigma occupancy |
+| **Throughput** | `pressure` serves at least as many requests |
+| **Tail latency** | Expected to be *slightly worse*. This is not a failure |
+
+That last row matters. Keeping requests alive instead of letting them fail means more
+concurrent work, and more concurrent work costs tail latency. A run where `pressure`
+also wins on TTFT p99 is more likely to indicate it is quietly shedding load than that
+it is doing something right — check the served-request count before celebrating.
+
+**Run it:**
+
+```bash
+cd "$(git rev-parse --show-toplevel)" && ./bench/run_pressure_comparison.sh 8
+```
+
+The script builds in the foreground first, then for each arm and each repeat restarts
+the four backends cold, starts a fresh router, polls until it is actually listening,
+runs the trace, and scrapes the router's counters before shutting it down. Default is
+3 repeats per arm; override with `REPEATS=5`.
+
+### Measuring time at the ceiling
+
+Error rate comes from the load generator. The mechanism half cannot: in proxy mode the
+generator only ever sees the router's single URL and never learns which backend served
+a request, which is why `occupancy_stats.py` prints nothing for these runs.
+
+The router samples every backend on a fixed 100 ms tick instead, independent of traffic.
+This is deliberate — sampling on the request path would only ever observe the backend
+that was *chosen*, so a backend the policy correctly stops choosing because it is
+saturated would freeze at a stale value. That is exactly the backend the criterion is
+about.
+
+The comparison script prints this per run. To read it from a router that is already
+running:
+
+```bash
+cd "$(git rev-parse --show-toplevel)" && python3 bench/ceiling_stats.py http://127.0.0.1:9090/metrics
+```
+
+`FLEET` is the headline: the share of all backend-time spent at or above sigma. Compare
+that number between the two arms.
+
+### Reading the result
+
+| Check | Where | Pass condition |
+|---|---|---|
+| Error rate | `compare.py` table, `err%` column | `pressure` mean at least 3x below `p2c` mean, with non-overlapping run-to-run ranges |
+| Time at ceiling | `ceiling_stats.py`, `FLEET` row | Lower for `pressure` |
+| Requests served | `compare.py` table, `n` column | `pressure` >= `p2c` |
+| Gate is active | `router_saturated_dispatches_total` | Non-zero under `pressure`. Stuck at zero usually means sigma or the KV model is wrong, not that the gate is unnecessary |
+| No leak | `router_backend_kv_projected` in the saved `_metrics.txt` | Returns toward zero as the run drains. A monotonic rise is a lease leak — fix that before reading anything else |
+| No measurement corruption | `verify.py` output | 0 failures |
+
+If error rate improves but the ceiling fraction does not move, the improvement is not
+coming from the mechanism the design claims, and the result should not be published as
+though it were.

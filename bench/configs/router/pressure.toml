@@ -3,11 +3,16 @@ bind = "0.0.0.0:8080"
 admin_bind = "127.0.0.1:9090"
 
 [routing]
-strategy = "p2c"
+strategy = "pressure"
 # Must match what the engine actually allocates. The simulator reserves prompt
 # blocks at admission and never grows them; real vLLM grows as it generates.
 # The two differ by roughly 2x, and the admission gate is built on the answer.
 kv_model = "prompt_only"
+theta = 0.55
+penalty = 10.0
+
+[admission]
+sigma = 0.95
 
 [observability]
 # Traffic-independent occupancy sampling. A backend the policy is correctly

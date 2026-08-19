@@ -49,18 +49,20 @@ fn main() -> anyhow::Result<()> {
 
     let kv_model = config.kv_model;
 
+    // No catch-all arm: an unknown name is rejected in config validation, so a
+    // typo cannot silently start the default policy under another arm's name.
     let strategy: Box<dyn RoutingStrategy> = match config.strategy.as_str() {
         "round_robin" => Box::new(RoundRobin::new()),
         "p2c" => Box::new(P2c),
         "least_requests" | "least_conn" => Box::new(LeastRequests),
         "least_kvts" => Box::new(LeastKvts),
-        // "pressure" is the default (and the Phase 2 shipping strategy)
-        _ => Box::new(Pressure {
+        "pressure" => Box::new(Pressure {
             theta: config.theta,
             penalty: config.penalty,
             sigma: config.sigma,
             kv_model,
         }),
+        other => anyhow::bail!("unknown strategy {other:?}"),
     };
     tracing::info!(strategy = strategy.name(), kv_model = ?kv_model, "starting router");
 
@@ -74,6 +76,16 @@ fn main() -> anyhow::Result<()> {
     });
 
     let runtime = tokio::runtime::Runtime::new()?;
+
+    // Traffic-independent occupancy sampling. Must run for every strategy, not
+    // just pressure: the criterion compares this fraction across arms.
+    let sample_interval = std::time::Duration::from_millis(config.occupancy_sample_interval_ms);
+    runtime.spawn(router_proxy::sampler::sample_occupancy_loop(
+        state.clone(),
+        config.sigma,
+        sample_interval,
+    ));
+
     runtime.block_on(router_proxy::listener::serve(&config.listener_bind, state))?;
 
     Ok(())

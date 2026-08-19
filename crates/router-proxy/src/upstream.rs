@@ -47,13 +47,18 @@ pin_project! {
     /// Relays response frames byte-identically while:
     ///   - classifying SSE frames to count content tokens
     ///   - feeding observed token counts into the `CostLease` for recharge
-    ///   - recording per-backend occupancy and inflight metrics
+    ///   - recording the request's terminal result exactly once
     ///   - releasing the `CostLease` on drop (covers normal completion,
     ///     error, client disconnect, timeout, and task cancellation)
     ///
     /// The lease is owned here, not in the handler, so that Tokio's
     /// drop-on-cancel releases the charge on client disconnect with no
     /// special-case code. (LLD §5.4 ownership rule)
+    ///
+    /// The *result* is recorded here for the same reason. A streaming request's
+    /// outcome is not known when the response head arrives: KV exhaustion is
+    /// delivered as an error object inside the body of an HTTP 200. Recording
+    /// success at dispatch time counts exactly those failures as successes.
     pub struct CountingSseBody<B> {
         #[pin]
         inner: B,
@@ -67,6 +72,22 @@ pin_project! {
         dispatched_at: Instant,
         first_token_at: Option<Instant>,
         saw_done_or_error: bool,
+        // Terminal-result accounting. `upstream_status` is the head we already
+        // relayed; `saw_error_frame` is an in-band failure on a 200.
+        upstream_status: hyper::StatusCode,
+        saw_error_frame: bool,
+    }
+
+    impl<B> PinnedDrop for CountingSseBody<B> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            let failed = *this.saw_error_frame || !this.upstream_status.is_success();
+            if failed {
+                let kind = if *this.saw_error_frame { "in_band_error" } else { "http_status" };
+                observe::record_backend_error(this.backend_key, kind);
+            }
+            observe::record_request_result(!failed);
+        }
     }
 }
 
@@ -79,6 +100,7 @@ impl<B> CountingSseBody<B> {
         backend_key: Arc<str>,
         estimated_output_tokens: u32,
         dispatched_at: Instant,
+        upstream_status: hyper::StatusCode,
     ) -> Self {
         Self {
             inner,
@@ -90,6 +112,8 @@ impl<B> CountingSseBody<B> {
             dispatched_at,
             first_token_at: None,
             saw_done_or_error: false,
+            upstream_status,
+            saw_error_frame: false,
         }
     }
 }
@@ -135,7 +159,13 @@ where
                                             completion_tokens,
                                         );
                                     }
-                                    Some(sse::Frame::Done) | Some(sse::Frame::Error { .. }) => {
+                                    Some(sse::Frame::Error { .. }) => {
+                                        // KV exhaustion arrives here, on an HTTP 200.
+                                        // This is the primary failure mode being measured.
+                                        *this.saw_error_frame = true;
+                                        *this.saw_done_or_error = true;
+                                    }
+                                    Some(sse::Frame::Done) => {
                                         *this.saw_done_or_error = true;
                                     }
                                     _ => {}
@@ -219,7 +249,7 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(chunks);
         let inner = StreamBody::new(stream);
-        let mut body = CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now());
+        let mut body = CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(), hyper::StatusCode::OK);
 
         while let Some(f) =
             futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
@@ -244,7 +274,7 @@ mod tests {
         let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![];
         let stream = futures_util::stream::iter(chunks);
         let inner = StreamBody::new(stream);
-        let body = CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now());
+        let body = CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(), hyper::StatusCode::OK);
 
         drop(body); // lease dropped here
 
@@ -252,6 +282,67 @@ mod tests {
             "inflight must be 0 after body drop");
         assert_eq!(backend.live.kv_projected_tokens.load(Relaxed), 0,
             "kv_projected must be 0 after body drop");
+    }
+
+    /// An in-band error frame on an HTTP 200 must be recognised as a failure.
+    /// This is the shape KV exhaustion arrives in, and treating it as a success
+    /// is what once made a 60% error rate read as 0.0%.
+    #[tokio::test]
+    async fn in_band_error_frame_on_http_200_is_a_failure() {
+        let backend = test_backend();
+        let lease = open_lease(backend.clone());
+
+        let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(BodyFrame::data(Bytes::from_static(
+                b"data: {\"error\":{\"message\":\"the kv cache does not have sufficient capacity\"}}\n",
+            ))),
+            Ok(BodyFrame::data(Bytes::from_static(b"data: [DONE]\n"))),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let inner = StreamBody::new(stream);
+        let mut body =
+            CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(),
+                                 hyper::StatusCode::OK);
+
+        while let Some(f) =
+            futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            f.unwrap();
+        }
+
+        assert!(body.saw_error_frame,
+            "an error object inside a 200 body must be recorded as a failure");
+        assert_eq!(body.content_tokens, 0,
+            "an error stream carries no content tokens");
+    }
+
+    /// A clean stream must not be misclassified as a failure.
+    #[tokio::test]
+    async fn clean_stream_on_http_200_is_a_success() {
+        let backend = test_backend();
+        let lease = open_lease(backend.clone());
+
+        let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(BodyFrame::data(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            ))),
+            Ok(BodyFrame::data(Bytes::from_static(b"data: [DONE]\n"))),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let inner = StreamBody::new(stream);
+        let mut body =
+            CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(),
+                                 hyper::StatusCode::OK);
+
+        while let Some(f) =
+            futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            f.unwrap();
+        }
+
+        assert!(!body.saw_error_frame);
+        assert!(body.upstream_status.is_success());
+        assert_eq!(body.content_tokens, 1);
     }
 
     /// Recharge fires when observed tokens exceed the estimate under PromptPlusOutput.
@@ -270,7 +361,7 @@ mod tests {
             .collect();
         let stream = futures_util::stream::iter(content_frames);
         let inner = StreamBody::new(stream);
-        let mut body = CountingSseBody::new(inner, lease, backend.key.clone(), 3, Instant::now());
+        let mut body = CountingSseBody::new(inner, lease, backend.key.clone(), 3, Instant::now(), hyper::StatusCode::OK);
 
         while let Some(f) =
             futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await

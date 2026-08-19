@@ -57,7 +57,6 @@ async fn handle_inner(
 
     let snap = state.snapshot.load();
     if snap.healthy.is_empty() {
-        observe::record_request_result(false);
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -127,7 +126,6 @@ async fn handle_inner(
         Err(_) => {
             // lease drops here → release() called → inflight--, kv_projected-=charged
             drop(lease);
-            observe::record_request_result(false);
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
@@ -136,7 +134,6 @@ async fn handle_inner(
         Ok(r) => r,
         Err(_) => {
             observe::record_backend_error(&backend.key, "connect");
-            observe::record_request_result(false);
             // lease drops here
             drop(lease);
             return Err(StatusCode::BAD_GATEWAY);
@@ -146,16 +143,21 @@ async fn handle_inner(
     let (resp_parts, resp_body) = resp.into_parts();
 
     // Move the lease into CountingSseBody. From this point, drop of the body
-    // releases the charge — covering normal completion, error, client
-    // disconnect, timeout, and task cancellation (LLD §5.4 ownership rule).
+    // releases the charge AND records the terminal result — covering normal
+    // completion, error, client disconnect, timeout, and task cancellation
+    // (LLD §5.4 ownership rule).
+    //
+    // The result is deliberately NOT recorded here. The response head says
+    // nothing about whether the request succeeded: a KV-exhaustion failure is
+    // an error object inside the body of an HTTP 200.
     let counted = CountingSseBody::new(
         resp_body,
         lease,
         backend.key.clone(),
         features.expected_output_tokens,
         now,
+        resp_parts.status,
     );
-    observe::record_request_result(true);
 
     let body: ResponseBody = counted.map_err(hyper::Error::from).boxed();
     Ok(Response::from_parts(resp_parts, body))

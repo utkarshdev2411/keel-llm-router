@@ -4,5 +4,6 @@ pub mod length_estimator;
 pub mod listener;
 pub mod observe;
 pub mod router;
+pub mod sampler;
 pub mod sse;
 pub mod upstream;

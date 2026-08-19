@@ -4,27 +4,36 @@ admin_bind = "127.0.0.1:9090"
 
 [routing]
 strategy = "least_requests"
+# Must match what the engine actually allocates. The simulator reserves prompt
+# blocks at admission and never grows them; real vLLM grows as it generates.
+# The two differ by roughly 2x, and the admission gate is built on the answer.
+kv_model = "prompt_only"
+
+[observability]
+# Traffic-independent occupancy sampling. A backend the policy is correctly
+# avoiding serves no requests, so it must be sampled on a clock, not on arrival.
+occupancy_sample_interval_ms = 100
 
 [[backends]]
 url = "http://127.0.0.1:8001"
 model = "test-model"
-kv_tokens = 8192
+kv_tokens = 8192      # 512 blocks * block-size 16, matching restart_sims.sh
 max_num_seqs = 64
 
 [[backends]]
 url = "http://127.0.0.1:8002"
 model = "test-model"
-kv_tokens = 8192
+kv_tokens = 8192      # 512 blocks * block-size 16, matching restart_sims.sh
 max_num_seqs = 64
 
 [[backends]]
 url = "http://127.0.0.1:8003"
 model = "test-model"
-kv_tokens = 8192
+kv_tokens = 8192      # 512 blocks * block-size 16, matching restart_sims.sh
 max_num_seqs = 64
 
 [[backends]]
 url = "http://127.0.0.1:8004"
 model = "test-model"
-kv_tokens = 8192
+kv_tokens = 8192      # 512 blocks * block-size 16, matching restart_sims.sh
 max_num_seqs = 64

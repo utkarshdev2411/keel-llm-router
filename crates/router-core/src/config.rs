@@ -11,6 +11,8 @@ pub struct RawConfig {
     pub routing: RawRouting,
     #[serde(default)]
     pub admission: RawAdmission,
+    #[serde(default)]
+    pub observability: RawObservability,
     pub backends: Vec<RawBackend>,
 }
 
@@ -90,6 +92,26 @@ impl Default for RawAdmission {
 }
 
 #[derive(Deserialize)]
+pub struct RawObservability {
+    /// Tick for the periodic all-backend occupancy sampler. The mechanism half
+    /// of the Phase 2 criterion is a fraction of wall-clock time, so it needs a
+    /// traffic-independent sample: a backend the policy is correctly avoiding
+    /// generates no requests and would otherwise never be observed.
+    #[serde(default = "default_occupancy_sample_interval_ms")]
+    pub occupancy_sample_interval_ms: u64,
+}
+
+fn default_occupancy_sample_interval_ms() -> u64 {
+    100
+}
+
+impl Default for RawObservability {
+    fn default() -> Self {
+        Self { occupancy_sample_interval_ms: default_occupancy_sample_interval_ms() }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct RawBackend {
     pub url: String,
     pub model: String,
@@ -114,6 +136,7 @@ pub struct Config {
     pub kv_model: KvModel,
     pub decision_trace_sample_rate: f64,
     pub route_p50_halflife_s: f64,
+    pub occupancy_sample_interval_ms: u64,
     pub backends: Vec<RawBackend>,
 }
 
@@ -129,6 +152,10 @@ pub enum ConfigError {
     SigmaOutOfRange(f64),
     #[error("no backends configured")]
     NoBackends,
+    #[error("occupancy_sample_interval_ms must be > 0")]
+    ZeroSampleInterval,
+    #[error("unknown strategy {0:?} (expected one of: pressure, p2c, least_requests, round_robin, least_kvts)")]
+    UnknownStrategy(String),
     #[error("duplicate backend url: {0}")]
     DuplicateBackend(String),
 }
@@ -143,6 +170,18 @@ impl RawConfig {
         }
         if !(0.0 < self.admission.sigma && self.admission.sigma <= 1.0) {
             return Err(ConfigError::SigmaOutOfRange(self.admission.sigma));
+        }
+        if self.observability.occupancy_sample_interval_ms == 0 {
+            return Err(ConfigError::ZeroSampleInterval);
+        }
+        // Reject an unknown strategy rather than silently falling back. A typo in a
+        // comparison config would otherwise run the default policy under the other
+        // arm's name, and the benchmark would compare a policy against itself.
+        if !matches!(
+            self.routing.strategy.as_str(),
+            "pressure" | "p2c" | "least_requests" | "least_conn" | "round_robin" | "least_kvts"
+        ) {
+            return Err(ConfigError::UnknownStrategy(self.routing.strategy.clone()));
         }
 
         let mut seen = HashSet::new();
@@ -169,6 +208,7 @@ impl RawConfig {
             kv_model: self.routing.kv_model.unwrap_or(KvModel::PromptOnly),
             decision_trace_sample_rate: self.routing.decision_trace_sample_rate,
             route_p50_halflife_s: self.routing.route_p50_halflife_s,
+            occupancy_sample_interval_ms: self.observability.occupancy_sample_interval_ms,
             backends: self.backends,
         })
     }
@@ -187,6 +227,7 @@ mod tests {
             },
             routing: RawRouting::default(),
             admission: RawAdmission::default(),
+            observability: RawObservability::default(),
             backends: vec![RawBackend {
                 url: "http://a:8000".into(),
                 model: "m".into(),
@@ -201,6 +242,32 @@ mod tests {
     fn zero_denominator_rejected_at_load() {
         assert!(matches!(raw(0, 32).validate(), Err(ConfigError::ZeroKvCapacity(_))));
         assert!(matches!(raw(8192, 0).validate(), Err(ConfigError::ZeroMaxNumSeqs(_))));
+    }
+
+    /// A typo must not silently start the default policy. If it did, a
+    /// comparison run would measure the default against itself under the
+    /// other arm's name and report a null result as a real one.
+    #[test]
+    fn unknown_strategy_is_rejected_not_defaulted() {
+        let mut c = raw(8192, 32);
+        c.routing.strategy = "presure".into();
+        assert!(matches!(c.validate(), Err(ConfigError::UnknownStrategy(_))));
+    }
+
+    #[test]
+    fn every_shipping_strategy_name_is_accepted() {
+        for name in ["pressure", "p2c", "least_requests", "least_conn", "round_robin", "least_kvts"] {
+            let mut c = raw(8192, 32);
+            c.routing.strategy = name.into();
+            assert!(c.validate().is_ok(), "{name} must be a valid strategy name");
+        }
+    }
+
+    #[test]
+    fn zero_sample_interval_rejected() {
+        let mut c = raw(8192, 32);
+        c.observability.occupancy_sample_interval_ms = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::ZeroSampleInterval)));
     }
 
     #[test]
