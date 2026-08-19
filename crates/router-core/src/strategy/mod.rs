@@ -1,9 +1,13 @@
+mod least_kvts;
 mod least_requests;
 mod p2c;
+mod pressure;
 mod round_robin;
 
+pub use least_kvts::LeastKvts;
 pub use least_requests::LeastRequests;
 pub use p2c::P2c;
+pub use pressure::Pressure;
 pub use round_robin::RoundRobin;
 
 use rand::rngs::SmallRng;

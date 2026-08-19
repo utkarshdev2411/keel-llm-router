@@ -14,5 +14,5 @@ pub use config::{Config, ConfigError, RawConfig};
 pub use cost::KvModel;
 pub use features::RequestFeatures;
 pub use lease::CostLease;
-pub use strategy::RoutingStrategy;
+pub use strategy::{LeastKvts, LeastRequests, P2c, Pressure, RoundRobin, RoutingStrategy};
 pub use trace::{CandidateScore, DecisionTrace, GateReason};
