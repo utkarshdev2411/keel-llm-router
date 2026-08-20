@@ -17,9 +17,19 @@ fn main() -> anyhow::Result<()> {
     let config = raw.validate()?;
 
     let admin_bind: std::net::SocketAddr = config.admin_bind.parse()?;
-    if let Err(e) = observe::install_metrics_recorder(admin_bind) {
-        tracing::warn!(?e, "metrics recorder already installed or failed");
-    }
+    // Fatal, not a warning. Every Phase 2 number -- error attribution, occupancy,
+    // time at the ceiling, saturated dispatches -- is read from this endpoint. A
+    // router that comes up without it serves traffic perfectly well and reports
+    // nothing, so the run looks successful and produces no data. A stale router
+    // from a previous run holding the port is the common cause, and it is exactly
+    // how a comparison arm gets silently lost.
+    observe::install_metrics_recorder(admin_bind).map_err(|e| {
+        anyhow::anyhow!(
+            "could not bind the admin/metrics listener on {admin_bind}: {e}. \
+             Another router is probably still running -- check with `ss -ltn` and \
+             kill it. Refusing to start without metrics."
+        )
+    })?;
     observe::describe_metrics();
 
     let backends: Vec<Arc<Backend>> = config
@@ -73,6 +83,9 @@ fn main() -> anyhow::Result<()> {
         max_request_body_bytes: config.max_request_body_bytes,
         decision_trace_sample_rate: config.decision_trace_sample_rate,
         kv_model,
+        route_hists: Arc::new(router_proxy::length_estimator::RouteHistograms::new(
+            config.route_p50_halflife_s,
+        )),
     });
 
     let runtime = tokio::runtime::Runtime::new()?;

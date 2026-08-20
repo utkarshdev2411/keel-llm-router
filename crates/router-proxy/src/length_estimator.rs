@@ -1,29 +1,38 @@
-/// Per-route output-length estimation for Phase 2.
-///
-/// The algorithm uses `max_tokens` when the client supplies it (an exact upper bound,
-/// free). Otherwise it draws from a decaying per-route histogram of recently observed
-/// output lengths. **One estimate** is returned — the gate and the score use the same
-/// projection. An earlier design used a separate high-percentile estimate for admission
-/// only; the validated gate does not do that.
-///
-/// No learned model, ever. Published work found a coarse classifier at 61% accuracy
-/// still delivered most of the available benefit. Self-correction (the recharge loop
-/// in `CostLease`) is what makes this work, not prediction precision.
-use std::sync::Arc;
+//! Per-route output-length estimation.
+//!
+//! The estimate `ô` feeds both the KV projection and the admission gate. Priority:
+//! the client's `max_tokens` when present (an exact upper bound, free), otherwise a
+//! decaying per-route estimate of recently observed output lengths, otherwise a
+//! conservative default.
+//!
+//! **One estimate.** The gate and the score use the same number. An earlier design
+//! used a separate high-percentile estimate for admission only; the validated gate
+//! does not do that, so there is deliberately no p95 here.
+//!
+//! **No learned model.** Published work found a coarse classifier at 61% accuracy
+//! still delivered most of the available benefit. What makes this work is
+//! self-correction — the recharge loop in `CostLease` revises the projection upward
+//! when output overruns — not prediction precision.
+//!
+//! Note that under `kv_model = "prompt_only"` the estimate does not enter the
+//! projection at all, so nothing here affects routing. It becomes load-bearing under
+//! `prompt_plus_output`, which is what real vLLM needs.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use router_core::features::{RequestFeatures, RouteKey};
 
-/// A single decaying quantile sketch. Tracks a running weighted estimate using
-/// exponential decay so recent observations carry more weight than old ones.
+/// A decaying estimate of output length for one route.
 ///
-/// Implementation: a simple exponential moving average with a configurable half-life.
-/// This is deliberately unsophisticated — precision is not what drives the algorithm's
-/// correctness; self-correction via `observe_tokens` recharge is.
+/// An exponential moving average in the *time* domain, not the observation domain:
+/// weight decays by elapsed seconds, so a route that goes quiet for an hour and then
+/// returns is not still anchored to what it looked like before. Deliberately
+/// unsophisticated.
 pub struct DecayingQuantile {
     halflife_s: f64,
-    /// Current estimate (tokens). None until at least one observation.
     estimate: Option<f64>,
-    /// Timestamp of last observation (seconds since an arbitrary epoch).
     last_obs_s: f64,
 }
 
@@ -32,7 +41,6 @@ impl DecayingQuantile {
         Self { halflife_s, estimate: None, last_obs_s: 0.0 }
     }
 
-    /// Record a new observed output length and update the decaying estimate.
     pub fn observe(&mut self, value: u32, now_s: f64) {
         let v = value as f64;
         match self.estimate {
@@ -41,80 +49,106 @@ impl DecayingQuantile {
                 self.last_obs_s = now_s;
             }
             Some(prev) => {
-                // Exponential decay weight: how much the old estimate has faded
                 let elapsed = (now_s - self.last_obs_s).max(0.0);
                 let decay = (-elapsed * std::f64::consts::LN_2 / self.halflife_s).exp();
-                // Blend: new = old * decay + new_value * (1 - decay)
                 self.estimate = Some(prev * decay + v * (1.0 - decay));
                 self.last_obs_s = now_s;
             }
         }
     }
 
-    /// Current estimate in tokens. Returns `None` if no observations yet.
     pub fn estimate(&self) -> Option<u32> {
         self.estimate.map(|v| v.round() as u32)
     }
 }
 
-/// Per-route histogram holding a p50 and p95 decaying quantile.
-/// Only p50 is used for the output estimate (one estimate, same for scoring and gate).
-pub struct RouteHistogram {
-    pub p50: DecayingQuantile,
-    pub p95: DecayingQuantile,
-}
-
-impl RouteHistogram {
-    pub fn new(halflife_s: f64) -> Self {
-        Self {
-            p50: DecayingQuantile::new(halflife_s),
-            p95: DecayingQuantile::new(halflife_s * 3.0), // p95 decays slower
-        }
-    }
-
-    pub fn observe(&mut self, completion_tokens: u32, now_s: f64) {
-        self.p50.observe(completion_tokens, now_s);
-        self.p95.observe(completion_tokens, now_s);
-    }
-}
-
-/// Default fallback when no histogram entry exists yet. 128 tokens — deliberately
-/// conservative; under-estimates are corrected upward by the recharge loop.
+/// Conservative fallback before a route has any history. Under-estimates are
+/// corrected upward by the recharge loop, so erring low is cheap.
 pub const DEFAULT_OUTPUT_ESTIMATE: u32 = 128;
 
-/// Derive the output-length estimate `ô` for one request.
+/// The per-route store, shared across all connections.
 ///
-/// Priority (from the algorithm spec §5):
-/// 1. `max_tokens` from the request — an exact upper bound, always wins.
-/// 2. The route histogram p50.
-/// 3. The hardcoded default.
-///
-/// Returns a value >= 1. A zero estimate makes `prompt_plus_output` projection equal
-/// to `prompt_only`, silently changing the effective KV model.
-pub fn estimate_output_tokens(
-    max_tokens: Option<u32>,
-    route_hist: Option<&RouteHistogram>,
-) -> u32 {
-    if let Some(mt) = max_tokens {
-        return mt.max(1);
-    }
-    if let Some(hist) = route_hist {
-        if let Some(est) = hist.p50.estimate() {
-            return est.max(1);
-        }
-    }
-    DEFAULT_OUTPUT_ESTIMATE
+/// A plain `Mutex<HashMap>` rather than a sharded or lock-free map: the map holds one
+/// entry per (model, prompt-size bucket) pair, so it is tens of entries, and the
+/// critical section is a hash lookup plus a handful of float operations. At the
+/// request rates this router targets that is far below the point where lock
+/// contention is measurable against a ~68 ms TTFT. Revisit if
+/// `router_overhead_seconds` p99 starts tracking concurrency.
+pub struct RouteHistograms {
+    started: Instant,
+    halflife_s: f64,
+    inner: Mutex<HashMap<RouteKey, DecayingQuantile>>,
 }
 
-/// Derive the route key for histogram lookup.
-/// Buckets by model name and coarse prompt-length bucket (powers of 2, capped at 4096).
+impl RouteHistograms {
+    pub fn new(halflife_s: f64) -> Self {
+        Self { started: Instant::now(), halflife_s, inner: Mutex::new(HashMap::new()) }
+    }
+
+    /// Monotonic seconds since the store was created. Never a wall-clock read: a
+    /// clock step backwards would make `elapsed` negative and corrupt every decay.
+    fn now_s(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// Derive `ô` for one request. Always returns at least 1: a zero estimate makes
+    /// the `prompt_plus_output` projection equal `prompt_only`, silently changing the
+    /// effective KV model.
+    pub fn estimate(&self, key: &RouteKey, max_tokens: Option<u32>) -> u32 {
+        // The exact bound wins and costs no lock.
+        if let Some(mt) = max_tokens {
+            return mt.max(1);
+        }
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            // A poisoned lock means another thread panicked mid-update. That is a bug
+            // worth fixing, but refusing to route over it would turn an estimation
+            // detail into an outage. Fall back to the default.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .get(key)
+            .and_then(|q| q.estimate())
+            .map(|e| e.max(1))
+            .unwrap_or(DEFAULT_OUTPUT_ESTIMATE)
+    }
+
+    /// Feed back an observed output length, from the stream's usage frame.
+    pub fn observe(&self, key: &RouteKey, completion_tokens: u32) {
+        let now_s = self.now_s();
+        let halflife = self.halflife_s;
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .entry(key.clone())
+            .or_insert_with(|| DecayingQuantile::new(halflife))
+            .observe(completion_tokens, now_s);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+}
+
+/// Route key for a request: model name plus a coarse prompt-length bucket.
+///
+/// Bucketing by prompt size matters because output length correlates with it, and a
+/// single per-model estimate would average a 50-token prompt together with a
+/// 4000-token one.
 pub fn route_key_for(features: &RequestFeatures) -> RouteKey {
-    let bucket = prompt_bucket(features.prompt_tokens);
-    RouteKey(Arc::clone(&features.model), bucket)
+    route_key(&features.model, features.prompt_tokens)
+}
+
+/// Same, from the parts — used during feature construction, before a
+/// `RequestFeatures` exists to borrow from.
+pub fn route_key(model: &Arc<str>, prompt_tokens: u32) -> RouteKey {
+    RouteKey(Arc::clone(model), prompt_bucket(prompt_tokens))
 }
 
 fn prompt_bucket(tokens: u32) -> u32 {
-    // Round down to the nearest power of two, capped at 4096.
     if tokens == 0 {
         return 0;
     }
@@ -126,52 +160,62 @@ fn prompt_bucket(tokens: u32) -> u32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn max_tokens_always_wins_over_histogram_estimate() {
-        let mut hist = RouteHistogram::new(300.0);
-        // Seed the histogram with a high value
-        hist.observe(1000, 0.0);
-        hist.observe(1000, 1.0);
-        // But max_tokens=50 must win
-        assert_eq!(estimate_output_tokens(Some(50), Some(&hist)), 50);
+    fn key(model: &str, prompt: u32) -> RouteKey {
+        route_key(&Arc::from(model), prompt)
     }
 
     #[test]
-    fn histogram_decays_toward_recent_observations() {
-        let mut hist = RouteHistogram::new(1.0); // 1-second half-life for fast decay
-        // Seed with high value at t=0
-        hist.p50.observe(1000, 0.0);
-        // Many recent low observations at t=10 (10 half-lives later)
-        for i in 0..20 {
-            hist.p50.observe(100, 10.0 + i as f64 * 0.1);
-        }
-        let est = hist.p50.estimate().unwrap();
-        // After many observations of 100 with decay, estimate should be much closer to 100
-        assert!(
-            est < 500,
-            "estimate ({est}) should have decayed toward recent observations (100)"
-        );
+    fn max_tokens_always_wins_over_learned_estimate() {
+        let h = RouteHistograms::new(300.0);
+        let k = key("m", 100);
+        h.observe(&k, 1000);
+        assert_eq!(h.estimate(&k, Some(50)), 50);
     }
 
     #[test]
     fn estimate_falls_back_to_default_with_no_history() {
-        assert_eq!(estimate_output_tokens(None, None), DEFAULT_OUTPUT_ESTIMATE);
-        let empty_hist = RouteHistogram::new(300.0);
-        assert_eq!(estimate_output_tokens(None, Some(&empty_hist)), DEFAULT_OUTPUT_ESTIMATE);
+        let h = RouteHistograms::new(300.0);
+        assert_eq!(h.estimate(&key("m", 100), None), DEFAULT_OUTPUT_ESTIMATE);
     }
 
     #[test]
-    fn estimate_uses_histogram_when_no_max_tokens() {
-        let mut hist = RouteHistogram::new(300.0);
-        hist.observe(256, 0.0);
-        let est = estimate_output_tokens(None, Some(&hist));
-        assert_eq!(est, 256);
+    fn estimate_uses_observed_history_when_no_max_tokens() {
+        let h = RouteHistograms::new(300.0);
+        let k = key("m", 100);
+        h.observe(&k, 256);
+        assert_eq!(h.estimate(&k, None), 256);
     }
 
     #[test]
     fn zero_max_tokens_clamped_to_one() {
-        // A zero estimate is forbidden: it silently changes the effective KV model.
-        assert_eq!(estimate_output_tokens(Some(0), None), 1);
+        // A zero estimate silently changes the effective KV model.
+        let h = RouteHistograms::new(300.0);
+        assert_eq!(h.estimate(&key("m", 100), Some(0)), 1);
+    }
+
+    /// Routes must not share an estimate: a short-prompt route and a long-prompt
+    /// route on the same model have different output distributions.
+    #[test]
+    fn routes_are_keyed_separately_by_model_and_prompt_bucket() {
+        let h = RouteHistograms::new(300.0);
+        h.observe(&key("a", 100), 50);
+        h.observe(&key("b", 100), 900);
+        h.observe(&key("a", 4000), 400);
+        assert_eq!(h.estimate(&key("a", 100), None), 50);
+        assert_eq!(h.estimate(&key("b", 100), None), 900);
+        assert_eq!(h.estimate(&key("a", 4000), None), 400);
+        assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn estimate_decays_toward_recent_observations() {
+        let mut q = DecayingQuantile::new(1.0);
+        q.observe(1000, 0.0);
+        for i in 0..20 {
+            q.observe(100, 10.0 + i as f64 * 0.1);
+        }
+        let est = q.estimate().unwrap();
+        assert!(est < 500, "estimate ({est}) should have decayed toward 100");
     }
 
     #[test]
@@ -180,6 +224,27 @@ mod tests {
         assert_eq!(prompt_bucket(100), 64);
         assert_eq!(prompt_bucket(512), 512);
         assert_eq!(prompt_bucket(1000), 512);
-        assert_eq!(prompt_bucket(8192), 4096); // capped
+        assert_eq!(prompt_bucket(8192), 4096);
+    }
+
+    #[test]
+    fn shared_store_is_usable_from_many_threads() {
+        let h = Arc::new(RouteHistograms::new(300.0));
+        let mut handles = vec![];
+        for t in 0..8 {
+            let h = Arc::clone(&h);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let k = key("m", 100);
+                    h.observe(&k, 100 + t);
+                    let _ = h.estimate(&k, None);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let est = h.estimate(&key("m", 100), None);
+        assert!((100..=108).contains(&est), "estimate {est} outside observed range");
     }
 }

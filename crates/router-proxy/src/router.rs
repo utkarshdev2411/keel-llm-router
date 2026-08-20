@@ -16,8 +16,9 @@ use router_core::strategy::RoutingStrategy;
 use router_core::trace::DecisionTrace;
 
 use crate::inbound;
+use crate::length_estimator::{self, RouteHistograms};
 use crate::observe;
-use crate::upstream::{self, CountingSseBody};
+use crate::upstream::{self, BodyParams, CountingSseBody};
 
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
@@ -30,6 +31,9 @@ pub struct RouterState {
     /// KV projection model, from config. Controls whether generated tokens
     /// are charged as additional KV or not. Must match the backend engine.
     pub kv_model: KvModel,
+    /// Per-route output-length history. Supplies `ô` when the client sends no
+    /// `max_tokens`, and is fed back from each stream's usage frame.
+    pub route_hists: Arc<RouteHistograms>,
 }
 
 pub async fn handle(
@@ -52,7 +56,7 @@ async fn handle_inner(
         .await
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
 
-    let features = inbound::build_features(&body_bytes, now)
+    let features = inbound::build_features(&body_bytes, now, &state.route_hists)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let snap = state.snapshot.load();
@@ -152,11 +156,15 @@ async fn handle_inner(
     // an error object inside the body of an HTTP 200.
     let counted = CountingSseBody::new(
         resp_body,
-        lease,
-        backend.key.clone(),
-        features.expected_output_tokens,
-        now,
-        resp_parts.status,
+        BodyParams {
+            lease,
+            backend_key: backend.key.clone(),
+            estimated_output_tokens: features.expected_output_tokens,
+            dispatched_at: now,
+            upstream_status: resp_parts.status,
+            route: length_estimator::route_key_for(&features),
+            route_hists: state.route_hists.clone(),
+        },
     );
 
     let body: ResponseBody = counted.map_err(hyper::Error::from).boxed();

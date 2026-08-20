@@ -8,8 +8,10 @@ use http_body::{Body, Frame as BodyFrame, SizeHint};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use pin_project_lite::pin_project;
+use router_core::features::RouteKey;
 use router_core::lease::CostLease;
 
+use crate::length_estimator::RouteHistograms;
 use crate::observe;
 use crate::sse;
 
@@ -76,6 +78,10 @@ pin_project! {
         // relayed; `saw_error_frame` is an in-band failure on a 200.
         upstream_status: hyper::StatusCode,
         saw_error_frame: bool,
+        // Output-length feedback. The usage frame is the only place the real
+        // completion count appears, so the estimator is fed from here.
+        route: RouteKey,
+        route_hists: Arc<RouteHistograms>,
     }
 
     impl<B> PinnedDrop for CountingSseBody<B> {
@@ -91,30 +97,53 @@ pin_project! {
     }
 }
 
+/// Everything `CountingSseBody` needs besides the stream itself.
+///
+/// A struct rather than positional arguments: the list had grown to eight, and a
+/// mis-ordered `Instant`/`StatusCode` pair would compile silently.
+pub struct BodyParams {
+    /// Must already be opened (inflight incremented, KV charged). Ownership moves
+    /// into the body so the charge is released on drop of any exit path.
+    pub lease: CostLease,
+    pub backend_key: Arc<str>,
+    pub estimated_output_tokens: u32,
+    pub dispatched_at: Instant,
+    pub upstream_status: hyper::StatusCode,
+    pub route: RouteKey,
+    pub route_hists: Arc<RouteHistograms>,
+}
+
 impl<B> CountingSseBody<B> {
-    /// `lease` must already be opened (inflight incremented, KV charged).
-    /// Ownership is moved here so the lease is released on drop of this body.
-    pub fn new(
-        inner: B,
-        lease: CostLease,
-        backend_key: Arc<str>,
-        estimated_output_tokens: u32,
-        dispatched_at: Instant,
-        upstream_status: hyper::StatusCode,
-    ) -> Self {
+    pub fn new(inner: B, p: BodyParams) -> Self {
         Self {
             inner,
-            lease,
-            backend_key,
+            lease: p.lease,
+            backend_key: p.backend_key,
             line_buf: String::new(),
             content_tokens: 0,
-            estimated_output_tokens,
-            dispatched_at,
+            estimated_output_tokens: p.estimated_output_tokens,
+            dispatched_at: p.dispatched_at,
             first_token_at: None,
             saw_done_or_error: false,
-            upstream_status,
+            upstream_status: p.upstream_status,
             saw_error_frame: false,
+            route: p.route,
+            route_hists: p.route_hists,
         }
+    }
+}
+
+impl<B> CountingSseBody<B> {
+    /// Content frames seen so far. Test-facing: a frame count is not a token count,
+    /// so this is only meaningful against the usage frame it reconciles with.
+    pub fn content_tokens(&self) -> u32 {
+        self.content_tokens
+    }
+
+    /// Whether an error object arrived inside the body. This is how KV exhaustion
+    /// presents, on an HTTP 200.
+    pub fn saw_error_frame(&self) -> bool {
+        self.saw_error_frame
     }
 }
 
@@ -153,11 +182,18 @@ where
                                         }
                                     }
                                     Some(sse::Frame::Usage { completion_tokens }) => {
-                                        // Record output-length estimation accuracy.
                                         observe::record_output_length_ratio(
                                             *this.estimated_output_tokens,
                                             completion_tokens,
                                         );
+                                        // Close the estimation loop. Only the usage
+                                        // frame carries the engine's own count; the
+                                        // content-frame tally is a frame count, which
+                                        // is not the same thing.
+                                        if completion_tokens > 0 {
+                                            this.route_hists
+                                                .observe(this.route, completion_tokens);
+                                        }
                                     }
                                     Some(sse::Frame::Error { .. }) => {
                                         // KV exhaustion arrives here, on an HTTP 200.
@@ -230,6 +266,18 @@ mod tests {
         })
     }
 
+    fn test_params(lease: CostLease, backend: &Arc<Backend>, est: u32) -> BodyParams {
+        BodyParams {
+            lease,
+            backend_key: backend.key.clone(),
+            estimated_output_tokens: est,
+            dispatched_at: Instant::now(),
+            upstream_status: hyper::StatusCode::OK,
+            route: RouteKey(backend.model.clone(), 64),
+            route_hists: Arc::new(RouteHistograms::new(300.0)),
+        }
+    }
+
     fn open_lease(backend: Arc<Backend>) -> CostLease {
         CostLease::open(backend, 100, 50, KvModel::PromptOnly, Instant::now())
     }
@@ -249,7 +297,7 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(chunks);
         let inner = StreamBody::new(stream);
-        let mut body = CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(), hyper::StatusCode::OK);
+        let mut body = CountingSseBody::new(inner, test_params(lease, &backend, 50));
 
         while let Some(f) =
             futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
@@ -274,7 +322,7 @@ mod tests {
         let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![];
         let stream = futures_util::stream::iter(chunks);
         let inner = StreamBody::new(stream);
-        let body = CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(), hyper::StatusCode::OK);
+        let body = CountingSseBody::new(inner, test_params(lease, &backend, 50));
 
         drop(body); // lease dropped here
 
@@ -301,8 +349,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let inner = StreamBody::new(stream);
         let mut body =
-            CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(),
-                                 hyper::StatusCode::OK);
+            CountingSseBody::new(inner, test_params(lease, &backend, 50));
 
         while let Some(f) =
             futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
@@ -331,8 +378,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let inner = StreamBody::new(stream);
         let mut body =
-            CountingSseBody::new(inner, lease, backend.key.clone(), 50, Instant::now(),
-                                 hyper::StatusCode::OK);
+            CountingSseBody::new(inner, test_params(lease, &backend, 50));
 
         while let Some(f) =
             futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
@@ -343,6 +389,57 @@ mod tests {
         assert!(!body.saw_error_frame);
         assert!(body.upstream_status.is_success());
         assert_eq!(body.content_tokens, 1);
+    }
+
+    /// The estimation loop must actually close: a completed stream's usage frame
+    /// has to reach the store, so the NEXT request on that route stops using the
+    /// default. The store existed and was tested in isolation for a while without
+    /// anything on the request path calling it, which is exactly the failure this
+    /// asserts against.
+    #[tokio::test]
+    async fn usage_frame_feeds_the_route_estimate_for_the_next_request() {
+        let backend = test_backend();
+        let lease = open_lease(backend.clone());
+        let hists = Arc::new(RouteHistograms::new(300.0));
+        let route = RouteKey(backend.model.clone(), 64);
+
+        assert_eq!(
+            hists.estimate(&route, None),
+            crate::length_estimator::DEFAULT_OUTPUT_ESTIMATE,
+            "precondition: route has no history yet"
+        );
+
+        let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(BodyFrame::data(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":37}}\n",
+            ))),
+            Ok(BodyFrame::data(Bytes::from_static(b"data: [DONE]\n"))),
+        ];
+        let inner = StreamBody::new(futures_util::stream::iter(chunks));
+        let mut body = CountingSseBody::new(
+            inner,
+            BodyParams {
+                lease,
+                backend_key: backend.key.clone(),
+                estimated_output_tokens: 128,
+                dispatched_at: Instant::now(),
+                upstream_status: hyper::StatusCode::OK,
+                route: route.clone(),
+                route_hists: hists.clone(),
+            },
+        );
+
+        while let Some(f) =
+            futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            f.unwrap();
+        }
+
+        assert_eq!(
+            hists.estimate(&route, None),
+            37,
+            "the usage frame's completion_tokens must reach the route estimate"
+        );
     }
 
     /// Recharge fires when observed tokens exceed the estimate under PromptPlusOutput.
@@ -361,7 +458,7 @@ mod tests {
             .collect();
         let stream = futures_util::stream::iter(content_frames);
         let inner = StreamBody::new(stream);
-        let mut body = CountingSseBody::new(inner, lease, backend.key.clone(), 3, Instant::now(), hyper::StatusCode::OK);
+        let mut body = CountingSseBody::new(inner, test_params(lease, &backend, 3));
 
         while let Some(f) =
             futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
