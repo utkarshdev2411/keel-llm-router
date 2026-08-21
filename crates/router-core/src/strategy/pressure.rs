@@ -4,24 +4,13 @@ use smallvec::SmallVec;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::backend::{BackendId, Snapshot};
-use crate::cost::{KvModel, occupancy, pressure_score};
+use crate::cost::{occupancy, pressure_score, KvModel};
 use crate::features::RequestFeatures;
 use crate::gate;
 use crate::trace::{CandidateScore, DecisionTrace, GateReason};
 
 use super::RoutingStrategy;
 
-/// The shipping routing strategy.
-///
-/// Decision procedure (§4.2 of the LLD):
-/// 1. Compute `need_kv` from the configured `KvModel`.
-/// 2. Filter to eligible backends via the admission gate.
-/// 3. **If the eligible set is empty**, restore the full healthy set and increment
-///    `router_saturated_dispatches_total`. This is a correctness requirement, not a
-///    graceful-degradation nicety: a gate that refused would turn routing results into
-///    load-shedding artifacts.
-/// 4. Full argmin over `pressure_score`, **random** tie-break (never index-based).
-/// 5. Return `None` only when `snap.healthy` is itself empty.
 pub struct Pressure {
     pub theta: f64,
     pub penalty: f64,
@@ -53,23 +42,16 @@ impl RoutingStrategy for Pressure {
 
         let need_kv = self.kv_model.project(req.prompt_tokens, req.expected_output_tokens);
 
-        // --- Step 2: filter eligible backends ---
         let mut eligible: SmallVec<[BackendId; 16]> = SmallVec::new();
         gate::eligible(snap, need_kv, self.sigma, &mut eligible);
 
-        // --- Step 3: fall-through when nothing passes the gate ---
         let fell_through = eligible.is_empty();
         let pool: &[BackendId] = if fell_through {
-            // Gate found nothing clean. Dispatch to least-bad anyway.
-            // This is NOT a rejection. The caller (router.rs) is responsible
-            // for incrementing the saturated_dispatches counter — router-core
-            // must stay pure (no metrics crate dependency).
             &snap.healthy
         } else {
             &eligible
         };
 
-        // --- Step 4: full argmin over pressure_score, random tie-break ---
         let mut min_score = f64::INFINITY;
         let mut ties: SmallVec<[BackendId; 16]> = SmallVec::new();
 
@@ -88,11 +70,8 @@ impl RoutingStrategy for Pressure {
             }
         }
 
-        // Random tie-break — never index-based: at low load all scores are equal and
-        // an index tie-break sends every request to backend zero.
         let picked = ties.choose(rng).copied();
 
-        // --- Populate trace ---
         if let Some(t) = trace {
             t.strategy = self.name();
             t.chosen = picked;
@@ -106,7 +85,6 @@ impl RoutingStrategy for Pressure {
                     let b = &snap.backends[id.0 as usize];
                     let u = occupancy(b);
                     let score = pressure_score(u, self.theta, self.penalty);
-                    // Determine gate reason for backends that didn't pass
                     let gated_by = if !fell_through && !eligible.contains(&id) {
                         let kv_ok = b.live.kv_projected_tokens.load(Relaxed) + need_kv
                             <= (self.sigma * b.caps.kv_capacity_tokens as f64) as i64;
@@ -194,13 +172,8 @@ mod tests {
         Snapshot { epoch: 0, backends, healthy, ring: Box::new([]) }
     }
 
-    /// The load-bearing structural test for Phase 2:
-    /// When every backend is made ineligible by the gate, the router must still
-    /// dispatch rather than returning None or erroring. A router that returns None
-    /// here turns the whole result into a load-shedding artifact.
     #[test]
     fn dispatches_to_least_bad_when_no_backend_passes_the_gate() {
-        // All backends saturated: kv_projected == kv_capacity (occupancy = 1.0)
         let backends = vec![
             backend(0, 0, 8192, 8192, 32),
             backend(1, 0, 8192, 8192, 32),
@@ -209,13 +182,10 @@ mod tests {
         let s = snap(backends);
         let p = pressure();
         let mut rng = SmallRng::seed_from_u64(0);
-        // Request needs 100 KV tokens — would exceed sigma * capacity on all backends
         let result = p.pick(&s, &req(100, 0), &mut rng, None);
         assert!(result.is_some(), "must dispatch even when all backends exceed the gate");
     }
 
-    /// Random tie-break: at low load all backends score equally, so backend zero
-    /// must NOT be picked every time.
     #[test]
     fn tie_break_is_random_never_index_based() {
         let backends = vec![
@@ -234,7 +204,6 @@ mod tests {
         assert!(seen.len() > 1, "tie-break must not always pick backend 0; got {:?}", seen);
     }
 
-    /// Routing is deterministic given the same state and seed (NFR-9 / LLD §4.3).
     #[test]
     fn decision_is_deterministic_given_seed() {
         let backends = vec![
@@ -250,13 +219,8 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// pressure should pick the backend with the genuinely lower occupancy,
-    /// not the one that looks cheaper in absolute work terms.
     #[test]
     fn beats_least_requests_on_heavy_tailed_synthetic_snapshot() {
-        // Backend A: 1 long request, holds 4000/8192 KV tokens (occupancy ~0.49)
-        // Backend B: 3 short requests, holds 600/8192 KV tokens (occupancy ~0.37, but 3 inflight)
-        // Backend C: 0 requests, 0 KV (occupancy 0.0) — clear winner
         let backends = vec![
             backend(0, 1, 4000, 8192, 32),
             backend(1, 3, 600, 8192, 32),
@@ -269,7 +233,6 @@ mod tests {
         assert_eq!(picked, BackendId(2), "must pick the empty backend");
     }
 
-    /// Empty healthy → None
     #[test]
     fn empty_healthy_returns_none() {
         let s = Snapshot { epoch: 0, backends: vec![], healthy: Box::new([]), ring: Box::new([]) };
@@ -278,10 +241,8 @@ mod tests {
         assert!(p.pick(&s, &req(10, 5), &mut rng, None).is_none());
     }
 
-    /// Trace fell_through flag is set correctly
     #[test]
     fn trace_records_fell_through_flag() {
-        // All backends fully saturated on KV
         let backends = vec![
             backend(0, 0, 8192, 8192, 32),
             backend(1, 0, 8192, 8192, 32),

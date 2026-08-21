@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::backend::{BackendId, Snapshot};
 use crate::features::RequestFeatures;
 
+/// Audit trace recording state, evaluated scores, and selection outcome for a routing decision.
 #[derive(Default)]
 pub struct DecisionTrace {
     pub strategy: &'static str,
@@ -13,6 +14,7 @@ pub struct DecisionTrace {
     pub fell_through: bool,
 }
 
+/// Evaluated metrics and admission status for a backend candidate during routing decision.
 pub struct CandidateScore {
     pub backend: BackendId,
     pub score: f64,
@@ -24,15 +26,13 @@ pub struct CandidateScore {
     pub signal_age_ms: Option<u64>,
 }
 
+/// Specific resource limit that caused admission gate exclusion.
 pub enum GateReason {
     KvHeadroom,
     SlotLimit,
 }
 
-/// Shared by every strategy's `pick`, so trace population isn't duplicated
-/// per implementation. Baseline strategies have no occupancy/score concept
-/// yet (Phase 1, no cost model), so `occupancy`/`score` read 0.0 and
-/// `gated_by` is always `None` until Phase 2 introduces `pressure`.
+/// Records baseline decision trace metrics for strategies that do not compute cost scores.
 pub fn record_pick(
     trace: Option<&mut DecisionTrace>,
     strategy: &'static str,

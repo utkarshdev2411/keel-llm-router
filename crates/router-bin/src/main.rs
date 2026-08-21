@@ -17,12 +17,6 @@ fn main() -> anyhow::Result<()> {
     let config = raw.validate()?;
 
     let admin_bind: std::net::SocketAddr = config.admin_bind.parse()?;
-    // Fatal, not a warning. Every Phase 2 number -- error attribution, occupancy,
-    // time at the ceiling, saturated dispatches -- is read from this endpoint. A
-    // router that comes up without it serves traffic perfectly well and reports
-    // nothing, so the run looks successful and produces no data. A stale router
-    // from a previous run holding the port is the common cause, and it is exactly
-    // how a comparison arm gets silently lost.
     observe::install_metrics_recorder(admin_bind).map_err(|e| {
         anyhow::anyhow!(
             "could not bind the admin/metrics listener on {admin_bind}: {e}. \
@@ -59,8 +53,6 @@ fn main() -> anyhow::Result<()> {
 
     let kv_model = config.kv_model;
 
-    // No catch-all arm: an unknown name is rejected in config validation, so a
-    // typo cannot silently start the default policy under another arm's name.
     let strategy: Box<dyn RoutingStrategy> = match config.strategy.as_str() {
         "round_robin" => Box::new(RoundRobin::new()),
         "p2c" => Box::new(P2c),
@@ -90,8 +82,6 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
 
-    // Traffic-independent occupancy sampling. Must run for every strategy, not
-    // just pressure: the criterion compares this fraction across arms.
     let sample_interval = std::time::Duration::from_millis(config.occupancy_sample_interval_ms);
     runtime.spawn(router_proxy::sampler::sample_occupancy_loop(
         state.clone(),

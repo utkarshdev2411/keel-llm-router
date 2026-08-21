@@ -15,6 +15,7 @@ use crate::length_estimator::RouteHistograms;
 use crate::observe;
 use crate::sse;
 
+/// Error conditions encountered during upstream request building or network connection dispatch.
 #[derive(thiserror::Error, Debug)]
 pub enum UpstreamError {
     #[error("upstream connect failed: {0}")]
@@ -23,6 +24,7 @@ pub enum UpstreamError {
     Build(String),
 }
 
+/// Reconstructs an HTTP request targeting a specific backend URI, forwarding headers except Host.
 pub fn rebuild_request(
     parts: &hyper::http::request::Parts,
     body: Bytes,
@@ -46,40 +48,28 @@ pub fn rebuild_request(
 }
 
 pin_project! {
-    /// Relays response frames byte-identically while:
-    ///   - classifying SSE frames to count content tokens
-    ///   - feeding observed token counts into the `CostLease` for recharge
-    ///   - recording the request's terminal result exactly once
-    ///   - releasing the `CostLease` on drop (covers normal completion,
-    ///     error, client disconnect, timeout, and task cancellation)
+    /// Transparent SSE response body wrapper that performs stream parsing, token accounting, and terminal result recording.
     ///
-    /// The lease is owned here, not in the handler, so that Tokio's
-    /// drop-on-cancel releases the charge on client disconnect with no
-    /// special-case code. (LLD §5.4 ownership rule)
-    ///
-    /// The *result* is recorded here for the same reason. A streaming request's
-    /// outcome is not known when the response head arrives: KV exhaustion is
-    /// delivered as an error object inside the body of an HTTP 200. Recording
-    /// success at dispatch time counts exactly those failures as successes.
+    /// ### Key Architectural Responsibilities
+    /// - **RAII Lease Management**: Owns the `CostLease`, ensuring capacity charges are released on all exit paths
+    ///   (normal stream end, HTTP error, client disconnect, task cancellation).
+    /// - **Dynamic Recharge**: Classifies SSE content frames and feeds token counts into `CostLease` to revise KV projections upward on output overrun.
+    /// - **In-Band Error Classification**: Detects error payloads emitted within HTTP 200 streams (e.g. KV cache exhaustion)
+    ///   and records them as request failures.
+    /// - **Feedback Loop**: Extracts completion token usage from stream usage frames to update per-route output estimators.
     pub struct CountingSseBody<B> {
         #[pin]
         inner: B,
-        // RAII charge. Dropped when this body is dropped on any exit path.
         lease: CostLease,
         backend_key: Arc<str>,
         line_buf: String,
         content_tokens: u32,
-        // Estimated output tokens at dispatch time, for ratio recording.
         estimated_output_tokens: u32,
         dispatched_at: Instant,
         first_token_at: Option<Instant>,
         saw_done_or_error: bool,
-        // Terminal-result accounting. `upstream_status` is the head we already
-        // relayed; `saw_error_frame` is an in-band failure on a 200.
         upstream_status: hyper::StatusCode,
         saw_error_frame: bool,
-        // Output-length feedback. The usage frame is the only place the real
-        // completion count appears, so the estimator is fed from here.
         route: RouteKey,
         route_hists: Arc<RouteHistograms>,
     }
@@ -97,13 +87,8 @@ pin_project! {
     }
 }
 
-/// Everything `CountingSseBody` needs besides the stream itself.
-///
-/// A struct rather than positional arguments: the list had grown to eight, and a
-/// mis-ordered `Instant`/`StatusCode` pair would compile silently.
+/// Constructor parameters for initializing a `CountingSseBody`.
 pub struct BodyParams {
-    /// Must already be opened (inflight incremented, KV charged). Ownership moves
-    /// into the body so the charge is released on drop of any exit path.
     pub lease: CostLease,
     pub backend_key: Arc<str>,
     pub estimated_output_tokens: u32,
@@ -134,14 +119,10 @@ impl<B> CountingSseBody<B> {
 }
 
 impl<B> CountingSseBody<B> {
-    /// Content frames seen so far. Test-facing: a frame count is not a token count,
-    /// so this is only meaningful against the usage frame it reconciles with.
     pub fn content_tokens(&self) -> u32 {
         self.content_tokens
     }
 
-    /// Whether an error object arrived inside the body. This is how KV exhaustion
-    /// presents, on an HTTP 200.
     pub fn saw_error_frame(&self) -> bool {
         self.saw_error_frame
     }
@@ -164,8 +145,6 @@ where
                 if let Some(data) = frame.data_ref() {
                     if let Ok(text) = std::str::from_utf8(data) {
                         this.line_buf.push_str(text);
-                        // Drain complete lines; keep any trailing partial line
-                        // in the buffer — SSE frames can be split across reads.
                         while let Some(pos) = this.line_buf.find('\n') {
                             let line: String = this.line_buf.drain(..=pos).collect();
                             let line = line.trim();
@@ -174,8 +153,6 @@ where
                                 match sse::classify(&parsed) {
                                     Some(sse::Frame::Content { .. }) => {
                                         *this.content_tokens += 1;
-                                        // Feed the lease so it can recharge if output
-                                        // overruns the estimate (strictly >, not >=).
                                         this.lease.observe_tokens(1);
                                         if this.first_token_at.is_none() {
                                             *this.first_token_at = Some(Instant::now());
@@ -186,18 +163,12 @@ where
                                             *this.estimated_output_tokens,
                                             completion_tokens,
                                         );
-                                        // Close the estimation loop. Only the usage
-                                        // frame carries the engine's own count; the
-                                        // content-frame tally is a frame count, which
-                                        // is not the same thing.
                                         if completion_tokens > 0 {
                                             this.route_hists
                                                 .observe(this.route, completion_tokens);
                                         }
                                     }
                                     Some(sse::Frame::Error { .. }) => {
-                                        // KV exhaustion arrives here, on an HTTP 200.
-                                        // This is the primary failure mode being measured.
                                         *this.saw_error_frame = true;
                                         *this.saw_done_or_error = true;
                                     }
@@ -225,16 +196,19 @@ where
     }
 }
 
+/// Type alias for pooled hyper HTTP client.
 pub type PooledClient = hyper_util::client::legacy::Client<
     hyper_util::client::legacy::connect::HttpConnector,
     http_body_util::Full<Bytes>,
 >;
 
+/// Instantiates pooled HTTP client using Tokio runtime executor.
 pub fn build_client() -> PooledClient {
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build_http()
 }
 
+/// Dispatches HTTP request upstream using client pool.
 pub async fn dispatch(
     client: &PooledClient,
     req: Request<http_body_util::Full<Bytes>>,
@@ -282,12 +256,12 @@ mod tests {
         CostLease::open(backend, 100, 50, KvModel::PromptOnly, Instant::now())
     }
 
+    /// Verifies parsing and counting of content frames split across multiple stream chunks.
     #[tokio::test]
     async fn counts_content_frames_split_across_chunks() {
         let backend = test_backend();
         let lease = open_lease(backend.clone());
 
-        // Split a single SSE line across two chunks to exercise partial-line buffering.
         let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![
             Ok(BodyFrame::data(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel",
@@ -309,14 +283,12 @@ mod tests {
         assert!(body.saw_done_or_error);
     }
 
-    /// The lease is released (inflight=0, kv_projected=0) when the body is dropped —
-    /// this covers normal completion, error, and client disconnect uniformly.
+    /// Verifies that dropping the SSE response body releases backend in-flight and KV projections.
     #[tokio::test]
     async fn releases_lease_on_drop() {
         let backend = test_backend();
         let lease = open_lease(backend.clone());
 
-        // inflight should be 1 while the lease is open
         assert_eq!(backend.live.inflight.load(Relaxed), 1);
 
         let chunks: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = vec![];
@@ -324,7 +296,7 @@ mod tests {
         let inner = StreamBody::new(stream);
         let body = CountingSseBody::new(inner, test_params(lease, &backend, 50));
 
-        drop(body); // lease dropped here
+        drop(body);
 
         assert_eq!(backend.live.inflight.load(Relaxed), 0,
             "inflight must be 0 after body drop");
@@ -332,9 +304,7 @@ mod tests {
             "kv_projected must be 0 after body drop");
     }
 
-    /// An in-band error frame on an HTTP 200 must be recognised as a failure.
-    /// This is the shape KV exhaustion arrives in, and treating it as a success
-    /// is what once made a 60% error rate read as 0.0%.
+    /// Verifies that in-band error payloads on HTTP 200 streams are recorded as failures.
     #[tokio::test]
     async fn in_band_error_frame_on_http_200_is_a_failure() {
         let backend = test_backend();
@@ -363,7 +333,7 @@ mod tests {
             "an error stream carries no content tokens");
     }
 
-    /// A clean stream must not be misclassified as a failure.
+    /// Verifies clean stream completion recording on HTTP 200 responses.
     #[tokio::test]
     async fn clean_stream_on_http_200_is_a_success() {
         let backend = test_backend();
@@ -391,11 +361,7 @@ mod tests {
         assert_eq!(body.content_tokens, 1);
     }
 
-    /// The estimation loop must actually close: a completed stream's usage frame
-    /// has to reach the store, so the NEXT request on that route stops using the
-    /// default. The store existed and was tested in isolation for a while without
-    /// anything on the request path calling it, which is exactly the failure this
-    /// asserts against.
+    /// Verifies that stream usage frames feed observed completion tokens into the route length estimator.
     #[tokio::test]
     async fn usage_frame_feeds_the_route_estimate_for_the_next_request() {
         let backend = test_backend();
@@ -442,15 +408,13 @@ mod tests {
         );
     }
 
-    /// Recharge fires when observed tokens exceed the estimate under PromptPlusOutput.
+    /// Verifies that output token overrun triggers KV projection recharge under PromptPlusOutput mode.
     #[tokio::test]
     async fn recharge_fires_when_output_overruns_estimate() {
         let backend = test_backend();
-        // Open with a small estimate of 3 tokens under PromptPlusOutput
         let lease = CostLease::open(backend.clone(), 10, 3, KvModel::PromptPlusOutput, Instant::now());
         let kv_before = backend.live.kv_projected_tokens.load(Relaxed);
 
-        // Stream 10 content frames — well past the estimate of 3
         let content_frames: Vec<Result<BodyFrame<Bytes>, std::convert::Infallible>> = (0..10)
             .map(|_| Ok(BodyFrame::data(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n",

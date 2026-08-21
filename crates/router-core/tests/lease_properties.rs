@@ -1,16 +1,7 @@
-//! Randomized lifecycle properties for `CostLease`.
+//! Property-based testing for `CostLease` RAII lifecycle and counter invariants.
 //!
-//! The invariant under test is the one whose violation is silent and cumulative:
-//! when nothing is in flight, nothing may be projected. A leak here presents as a
-//! healthy backend gradually receiving less traffic, which is indistinguishable
-//! from a genuine routing result until someone thinks to check the counter.
-//!
-//! Deterministic loops cannot establish this. The failure modes that matter come
-//! from *interleaving* — leases opened against one backend, partially advanced,
-//! and released out of order, with some abandoned mid-stream the way a client
-//! disconnect abandons them. So the shapes are generated: how many concurrent
-//! leases, how far each one runs, which ones abort, and in what order the
-//! survivors are released.
+//! Verifies that under arbitrary request interleaving, token streaming, and abrupt aborts (e.g. disconnects),
+//! live counters (`inflight` and `kv_projected_tokens`) strictly return to zero when all leases are dropped.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -36,16 +27,14 @@ fn backend() -> Arc<Backend> {
     })
 }
 
-/// One request's life: its size, how many token batches it emits, and whether it
-/// ends cleanly or is abandoned partway.
+/// Simulated request lifecycle defining initial tokens, output streaming batches, and optional early cancellation point.
 #[derive(Debug, Clone)]
 struct Lifecycle {
     prompt: u32,
     o_hat: u32,
     prompt_plus_output: bool,
     batches: Vec<u32>,
-    /// `Some(k)` abandons the request after `k` batches — a client disconnect,
-    /// an upstream error, or a cancelled task. All three are the same code path.
+    /// Step index after which the request is dropped to simulate client disconnects or tasks cancellation.
     abort_after: Option<usize>,
 }
 
@@ -69,9 +58,7 @@ fn lifecycle() -> impl Strategy<Value = Lifecycle> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
-    /// However many requests run concurrently, however far each gets, and in
-    /// whatever order they finish or are abandoned, both counters must return to
-    /// exactly zero.
+    /// Asserts that inflight and projected KV counters return to zero regardless of lease execution order or early aborts.
     #[test]
     fn all_counters_return_to_zero_after_any_interleaving(
         lives in prop::collection::vec(lifecycle(), 1..30),
@@ -95,21 +82,16 @@ proptest! {
             "every opened lease must be counted in flight"
         );
 
-        // Advance all leases in lock-step, dropping each one at its abort point.
-        // Round-robin rather than one-at-a-time so charges genuinely overlap.
         let deepest = lives.iter().map(|l| l.batches.len()).max().unwrap_or(0);
         for step in 0..deepest {
             for (i, l) in lives.iter().enumerate() {
                 if l.abort_after == Some(step) {
-                    open[i] = None; // Drop mid-stream.
+                    open[i] = None;
                 }
                 if let (Some(lease), Some(&n)) = (open[i].as_mut(), l.batches.get(step)) {
                     lease.observe_tokens(n);
                 }
             }
-            // The projection may transiently exceed capacity — the gate filters,
-            // it does not clamp — but it must never go negative. A negative value
-            // means a release was double-counted.
             prop_assert!(
                 b.live.kv_projected_tokens.load(Relaxed) >= 0,
                 "kv_projected went negative at step {}: {}",
@@ -117,8 +99,6 @@ proptest! {
             );
         }
 
-        // Release the survivors in a rotated order, so completion order is not
-        // correlated with open order.
         let n = open.len();
         for k in 0..n {
             open[(k + release_rotation) % n] = None;
@@ -131,9 +111,7 @@ proptest! {
         );
     }
 
-    /// Releasing is exactly once per open, whatever happened in between. Dropping
-    /// a lease twice is impossible by move semantics; this guards the other side,
-    /// that an internal early release does not also fire on drop.
+    /// Verifies single lease charge-release symmetry upon completion or drop.
     #[test]
     fn charge_and_release_are_symmetric_for_one_lease(l in lifecycle()) {
         let b = backend();
@@ -155,9 +133,7 @@ proptest! {
         prop_assert_eq!(b.live.kv_projected_tokens.load(Relaxed), 0);
     }
 
-    /// Under `prompt_only` the projection is the prompt alone, no matter how much
-    /// output arrives. Recharge is inert here by design; a "fix" that made it fire
-    /// would silently change the effective KV model and mis-size the gate by ~2x.
+    /// Verifies that under PromptOnly mode, KV token projections remain constant as streaming tokens arrive.
     #[test]
     fn prompt_only_projection_never_moves_with_output(
         prompt in 1u32..4000,
@@ -179,10 +155,7 @@ proptest! {
         }
     }
 
-    /// Under `prompt_plus_output` the projection may only ever be revised upward,
-    /// never drawn down. The charge is a peak projection, not a running debt: a
-    /// backend must keep looking as loaded as it might get, not as loaded as it is
-    /// right now.
+    /// Verifies that under PromptPlusOutput mode, KV projections only increase monotonically as output overruns initial estimates.
     #[test]
     fn prompt_plus_output_projection_is_monotonically_non_decreasing(
         prompt in 1u32..4000,

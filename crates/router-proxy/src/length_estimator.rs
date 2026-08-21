@@ -1,22 +1,17 @@
-//! Per-route output-length estimation.
+//! Per-route output-length estimation (`ô`).
 //!
-//! The estimate `ô` feeds both the KV projection and the admission gate. Priority:
-//! the client's `max_tokens` when present (an exact upper bound, free), otherwise a
-//! decaying per-route estimate of recently observed output lengths, otherwise a
-//! conservative default.
+//! Provides estimated completion token counts used by KV projection and admission gating.
 //!
-//! **One estimate.** The gate and the score use the same number. An earlier design
-//! used a separate high-percentile estimate for admission only; the validated gate
-//! does not do that, so there is deliberately no p95 here.
+//! ### Estimation Priority
+//! 1. Client-supplied `max_tokens` (exact upper bound).
+//! 2. Time-decayed per-route historical estimate (`DecayingQuantile`).
+//! 3. Conservative default (`DEFAULT_OUTPUT_ESTIMATE = 128`).
 //!
-//! **No learned model.** Published work found a coarse classifier at 61% accuracy
-//! still delivered most of the available benefit. What makes this work is
-//! self-correction — the recharge loop in `CostLease` revises the projection upward
-//! when output overruns — not prediction precision.
-//!
-//! Note that under `kv_model = "prompt_only"` the estimate does not enter the
-//! projection at all, so nothing here affects routing. It becomes load-bearing under
-//! `prompt_plus_output`, which is what real vLLM needs.
+//! ### Key Architectural Guarantees
+//! - **Unified Estimate**: A single estimate is shared by both admission control and pressure scoring.
+//! - **Self-Correction over Precision**: Uses exponential time-decay rather than complex predictive models;
+//!   under-estimates are dynamically revised upward by `CostLease` token recharges.
+//! - **Mode Dependency**: Only impacts routing when `KvModel::PromptPlusOutput` is active.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,12 +19,10 @@ use std::time::Instant;
 
 use router_core::features::{RequestFeatures, RouteKey};
 
-/// A decaying estimate of output length for one route.
+/// Time-decaying output length estimator for a specific route.
 ///
-/// An exponential moving average in the *time* domain, not the observation domain:
-/// weight decays by elapsed seconds, so a route that goes quiet for an hour and then
-/// returns is not still anchored to what it looked like before. Deliberately
-/// unsophisticated.
+/// Implements an exponential moving average in the time domain (seconds elapsed) rather than observation domain,
+/// ensuring routes that remain idle decay their historical weighting rather than remaining anchored to old state.
 pub struct DecayingQuantile {
     halflife_s: f64,
     estimate: Option<f64>,
@@ -62,18 +55,15 @@ impl DecayingQuantile {
     }
 }
 
-/// Conservative fallback before a route has any history. Under-estimates are
-/// corrected upward by the recharge loop, so erring low is cheap.
+/// Fallback completion token estimate when no route history or `max_tokens` is available.
+///
+/// Initial under-estimates are safely corrected by `CostLease` runtime recharges.
 pub const DEFAULT_OUTPUT_ESTIMATE: u32 = 128;
 
-/// The per-route store, shared across all connections.
+/// Shared thread-safe store for per-route output length estimates.
 ///
-/// A plain `Mutex<HashMap>` rather than a sharded or lock-free map: the map holds one
-/// entry per (model, prompt-size bucket) pair, so it is tens of entries, and the
-/// critical section is a hash lookup plus a handful of float operations. At the
-/// request rates this router targets that is far below the point where lock
-/// contention is measurable against a ~68 ms TTFT. Revisit if
-/// `router_overhead_seconds` p99 starts tracking concurrency.
+/// Uses a `Mutex<HashMap>` keyed by `RouteKey` (model name + prompt length bucket).
+/// Lock hold time is microsecond-scale over tens of entries, introducing negligible contention relative to model TTFT.
 pub struct RouteHistograms {
     started: Instant,
     halflife_s: f64,
@@ -85,25 +75,21 @@ impl RouteHistograms {
         Self { started: Instant::now(), halflife_s, inner: Mutex::new(HashMap::new()) }
     }
 
-    /// Monotonic seconds since the store was created. Never a wall-clock read: a
-    /// clock step backwards would make `elapsed` negative and corrupt every decay.
+    /// Calculates monotonic seconds since creation to prevent clock skew from corrupting decay calculations.
     fn now_s(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
 
-    /// Derive `ô` for one request. Always returns at least 1: a zero estimate makes
-    /// the `prompt_plus_output` projection equal `prompt_only`, silently changing the
-    /// effective KV model.
+    /// Resolves the estimated completion tokens `ô` for a request.
+    ///
+    /// Priority: explicit `max_tokens` > route history > `DEFAULT_OUTPUT_ESTIMATE`.
+    /// Always returns at least 1 to ensure `PromptPlusOutput` projections do not collapse into `PromptOnly`.
     pub fn estimate(&self, key: &RouteKey, max_tokens: Option<u32>) -> u32 {
-        // The exact bound wins and costs no lock.
         if let Some(mt) = max_tokens {
             return mt.max(1);
         }
         let guard = match self.inner.lock() {
             Ok(g) => g,
-            // A poisoned lock means another thread panicked mid-update. That is a bug
-            // worth fixing, but refusing to route over it would turn an estimation
-            // detail into an outage. Fall back to the default.
             Err(poisoned) => poisoned.into_inner(),
         };
         guard
@@ -113,7 +99,7 @@ impl RouteHistograms {
             .unwrap_or(DEFAULT_OUTPUT_ESTIMATE)
     }
 
-    /// Feed back an observed output length, from the stream's usage frame.
+    /// Records an observed completion token length for a route key upon stream completion.
     pub fn observe(&self, key: &RouteKey, completion_tokens: u32) {
         let now_s = self.now_s();
         let halflife = self.halflife_s;
@@ -133,21 +119,19 @@ impl RouteHistograms {
     }
 }
 
-/// Route key for a request: model name plus a coarse prompt-length bucket.
+/// Derives a `RouteKey` combining the model identifier and prompt length bucket.
 ///
-/// Bucketing by prompt size matters because output length correlates with it, and a
-/// single per-model estimate would average a 50-token prompt together with a
-/// 4000-token one.
+/// Bucketing by prompt length separates short and long prompt distributions for the same model.
 pub fn route_key_for(features: &RequestFeatures) -> RouteKey {
     route_key(&features.model, features.prompt_tokens)
 }
 
-/// Same, from the parts — used during feature construction, before a
-/// `RequestFeatures` exists to borrow from.
+/// Constructs a `RouteKey` from model name and prompt token count.
 pub fn route_key(model: &Arc<str>, prompt_tokens: u32) -> RouteKey {
     RouteKey(Arc::clone(model), prompt_bucket(prompt_tokens))
 }
 
+/// Buckets prompt token counts into logarithmic power-of-two intervals capped at 4096.
 fn prompt_bucket(tokens: u32) -> u32 {
     if tokens == 0 {
         return 0;
@@ -164,6 +148,7 @@ mod tests {
         route_key(&Arc::from(model), prompt)
     }
 
+    /// Verifies that explicit max_tokens takes precedence over learned estimates.
     #[test]
     fn max_tokens_always_wins_over_learned_estimate() {
         let h = RouteHistograms::new(300.0);
@@ -172,12 +157,14 @@ mod tests {
         assert_eq!(h.estimate(&k, Some(50)), 50);
     }
 
+    /// Verifies default fallback when no history exists for a route.
     #[test]
     fn estimate_falls_back_to_default_with_no_history() {
         let h = RouteHistograms::new(300.0);
         assert_eq!(h.estimate(&key("m", 100), None), DEFAULT_OUTPUT_ESTIMATE);
     }
 
+    /// Verifies estimation uses observed history when max_tokens is absent.
     #[test]
     fn estimate_uses_observed_history_when_no_max_tokens() {
         let h = RouteHistograms::new(300.0);
@@ -186,15 +173,14 @@ mod tests {
         assert_eq!(h.estimate(&k, None), 256);
     }
 
+    /// Ensures zero max_tokens is clamped to 1 to preserve PromptPlusOutput model semantics.
     #[test]
     fn zero_max_tokens_clamped_to_one() {
-        // A zero estimate silently changes the effective KV model.
         let h = RouteHistograms::new(300.0);
         assert_eq!(h.estimate(&key("m", 100), Some(0)), 1);
     }
 
-    /// Routes must not share an estimate: a short-prompt route and a long-prompt
-    /// route on the same model have different output distributions.
+    /// Verifies separate keying by model name and prompt bucket.
     #[test]
     fn routes_are_keyed_separately_by_model_and_prompt_bucket() {
         let h = RouteHistograms::new(300.0);
@@ -207,6 +193,7 @@ mod tests {
         assert_eq!(h.len(), 3);
     }
 
+    /// Verifies time-decay weighting toward recent observations.
     #[test]
     fn estimate_decays_toward_recent_observations() {
         let mut q = DecayingQuantile::new(1.0);
@@ -218,6 +205,7 @@ mod tests {
         assert!(est < 500, "estimate ({est}) should have decayed toward 100");
     }
 
+    /// Verifies prompt length bucketing to power-of-two bounds.
     #[test]
     fn prompt_bucket_rounds_to_power_of_two() {
         assert_eq!(prompt_bucket(1), 1);
@@ -227,6 +215,7 @@ mod tests {
         assert_eq!(prompt_bucket(8192), 4096);
     }
 
+    /// Verifies thread safety and concurrent updates across worker threads.
     #[test]
     fn shared_store_is_usable_from_many_threads() {
         let h = Arc::new(RouteHistograms::new(300.0));

@@ -1,102 +1,103 @@
+//! Observability, metrics registration, and telemetry recording helper routines.
+//!
+//! Provides JSON structured tracing initialization, Prometheus metrics setup,
+//! and metric helper functions for latency budgets, backend occupancy, and routing decision telemetry.
+
 use std::net::SocketAddr;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 
+/// Initializes structured JSON tracing with `tracing_subscriber`, falling back to `info` log level.
 pub fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
 }
 
-/// Installs the global Prometheus recorder, serving `/metrics` on `admin_bind`.
+/// Installs the global Prometheus metrics exporter listener serving `/metrics` on `admin_bind`.
 pub fn install_metrics_recorder(
     admin_bind: SocketAddr,
 ) -> Result<(), metrics_exporter_prometheus::BuildError> {
     PrometheusBuilder::new().with_http_listener(admin_bind).install()
 }
 
+/// Registers metadata and descriptions for all router Prometheus metrics.
 pub fn describe_metrics() {
-    // --- Request-level ---
+    // --- Request-level metrics ---
     metrics::describe_counter!(
         "router_requests_total",
-        "Requests by result. `result` is `ok` or `error`. \
-         There is no `rejected` label: admission never refuses a request."
+        "Total requests processed by outcome (`ok` or `error`). \
+         Reflects total traffic without a `rejected` label, as admission control never sheds requests."
     );
     metrics::describe_counter!(
         "router_backend_errors_total",
-        "Per-backend errors by kind. The primary result metric for routing-policy comparisons."
+        "Per-backend request error counter partitioned by error kind. \
+         Primary metric for routing policy efficacy comparisons."
     );
 
-    // --- Admission gate ---
+    // --- Admission gate metrics ---
     metrics::describe_counter!(
         "router_saturated_dispatches_total",
-        "How often the admission gate found no eligible backend. \
-         A pressure signal, NOT a drop count — every counted request was still dispatched."
+        "Count of dispatches where the admission gate found zero clean backends. \
+         Measures system load pressure; all counted requests are still dispatched to the least-bad backend."
     );
 
-    // --- Per-backend live state (Phase 2 mechanism metrics) ---
+    // --- Per-backend live state metrics ---
     metrics::describe_gauge!(
         "router_backend_occupancy",
-        "Fraction of capacity committed per backend: max(inflight/max_num_seqs, \
-         kv_projected/kv_capacity). The mechanism metric. \
-         Spread across backends and time at or above sigma explains the error-rate result."
+        "Committed capacity fraction per backend: `max(inflight / max_num_seqs, kv_projected / kv_capacity)`. \
+         Primary mechanism metric explaining error rates and load distribution."
     );
     metrics::describe_gauge!(
         "router_backend_kv_projected",
-        "Projected KV tokens held per backend. \
-         Monotonic rise is a leak — the most expensive bug in this project."
+        "Current projected KV tokens reserved per backend. \
+         Unbounded monotonic increase signals an unreleased lease memory leak."
     );
-    metrics::describe_gauge!("router_backend_inflight", "In-flight requests per backend.");
+    metrics::describe_gauge!("router_backend_inflight", "Current in-flight request count per backend.");
     metrics::describe_counter!(
         "router_backend_occupancy_ticks_total",
-        "Occupancy samples taken for this backend by the periodic sampler. \
-         The denominator for the time-at-ceiling fraction."
+        "Total periodic occupancy samples taken for a backend. Denominator for time-at-ceiling calculation."
     );
     metrics::describe_counter!(
         "router_backend_ticks_at_ceiling_total",
-        "Samples where this backend's occupancy was at or above sigma. \
-         Divided by router_backend_occupancy_ticks_total this is the fraction of \
-         the run the backend spent in the region the admission gate exists to avoid. \
-         This is the mechanism half of the Phase 2 exit criterion."
+        "Count of periodic occupancy samples where backend occupancy met or exceeded `sigma`. \
+         Ratio over total ticks measures fraction of run time spent in the saturated region."
     );
 
-    // --- Decision path timing ---
+    // --- Decision path latency metrics ---
     metrics::describe_histogram!(
         "router_decision_duration_seconds",
-        "Time spent in the routing decision per strategy. NFR-1 evidence (p99 < 10 µs target)."
+        "Routing strategy algorithm execution time (target: p99 < 10 µs)."
     );
     metrics::describe_histogram!(
         "router_overhead_seconds",
-        "End-to-end router cost per request: body parse + feature extraction + routing \
-         decision, measured to the moment the upstream request is dispatched. \
-         This is NFR-3's p99 < 1 ms budget."
+        "End-to-end router overhead prior to upstream dispatch (target: p99 < 1 ms)."
     );
 
-    // --- Output-length estimation accuracy (Phase 2) ---
+    // --- Estimation accuracy & drift metrics ---
     metrics::describe_histogram!(
         "router_output_length_ratio",
-        "Ratio of estimated output tokens to actual (usage.completion_tokens). \
-         Values near 1.0 mean the estimate is accurate; persistent drift means \
-         the histogram or the max_tokens heuristic is wrong."
+        "Ratio of estimated to actual completion tokens (`estimated / completion_tokens`). \
+         Ratios near 1.0 indicate accurate output length estimation."
     );
-
-    // --- Projection drift (Phase 3 cross-check, registered now) ---
     metrics::describe_gauge!(
         "router_projection_drift",
-        "Router's kv_projected/kv_capacity divided by the backend's reported kv_usage_perc. \
-         Should sit near 1.0. Departure by 2x in either direction means the kv_model is wrong."
+        "Ratio of router-projected KV fraction to backend-reported KV usage percentage. \
+         Significant divergence indicates KV cost model mis-calibration."
     );
 }
 
 // ---------------------------------------------------------------------------
-// Recording helpers
+// Recording helper routines
 // ---------------------------------------------------------------------------
 
+/// Records final request status (`ok` vs `error`) to `router_requests_total`.
 pub fn record_request_result(ok: bool) {
     let result = if ok { "ok" } else { "error" };
     metrics::counter!("router_requests_total", "result" => result).increment(1);
 }
 
+/// Records a backend error labeled by backend identifier and error classification.
 pub fn record_backend_error(backend_key: &str, kind: &str) {
     metrics::counter!(
         "router_backend_errors_total",
@@ -106,21 +107,19 @@ pub fn record_backend_error(backend_key: &str, kind: &str) {
     .increment(1);
 }
 
+/// Updates the current active in-flight request gauge for a backend.
 pub fn record_inflight(backend_key: &str, n: u32) {
     metrics::gauge!("router_backend_inflight", "backend" => backend_key.to_string())
         .set(n as f64);
 }
 
-/// Phase 2: record occupancy after each dispatch.
+/// Updates the active committed capacity occupancy gauge after dispatch.
 pub fn record_occupancy(backend_key: &str, occupancy: f64) {
     metrics::gauge!("router_backend_occupancy", "backend" => backend_key.to_string())
         .set(occupancy);
 }
 
-/// One occupancy sample from the periodic sampler. Always increments the
-/// denominator; increments the ceiling counter only when at or above sigma.
-/// Both must be counters, not gauges: the criterion is a fraction of the whole
-/// run, so the samples have to accumulate.
+/// Records a periodic occupancy sample, incrementing total ticks and conditionally ceiling ticks when >= `sigma`.
 pub fn record_occupancy_tick(backend_key: &str, at_ceiling: bool) {
     metrics::counter!(
         "router_backend_occupancy_ticks_total",
@@ -136,12 +135,13 @@ pub fn record_occupancy_tick(backend_key: &str, at_ceiling: bool) {
     }
 }
 
-/// Phase 2: record kv_projected after each dispatch.
+/// Updates the active projected KV token gauge for a backend.
 pub fn record_kv_projected(backend_key: &str, tokens: i64) {
     metrics::gauge!("router_backend_kv_projected", "backend" => backend_key.to_string())
         .set(tokens as f64);
 }
 
+/// Records routing strategy decision duration to `router_decision_duration_seconds`.
 pub fn record_decision_duration(strategy: &str, seconds: f64) {
     metrics::histogram!(
         "router_decision_duration_seconds",
@@ -150,12 +150,12 @@ pub fn record_decision_duration(strategy: &str, seconds: f64) {
     .record(seconds);
 }
 
+/// Records end-to-end pre-dispatch processing overhead to `router_overhead_seconds`.
 pub fn record_router_overhead(seconds: f64) {
     metrics::histogram!("router_overhead_seconds").record(seconds);
 }
 
-/// Phase 2: record ratio of estimated to actual output tokens.
-/// Called once per completed streaming request when usage frame is available.
+/// Records the ratio of estimated to actual completion tokens upon request stream completion.
 pub fn record_output_length_ratio(estimated: u32, actual: u32) {
     if actual > 0 {
         let ratio = estimated as f64 / actual as f64;

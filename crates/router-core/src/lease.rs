@@ -5,7 +5,10 @@ use std::time::Instant;
 use crate::backend::Backend;
 use crate::cost::KvModel;
 
-/// Not Clone, not Copy. Exactly one release per open, on every exit path.
+/// RAII guard representing a backend resource lease.
+///
+/// Tracks inflight sequence count and projected KV token capacity.
+/// Exactly one release per open is guaranteed on all exit paths via `Drop`.
 pub struct CostLease {
     backend: Arc<Backend>,
     charged: i64,
@@ -45,17 +48,10 @@ impl CostLease {
         self.dispatched_at
     }
 
-    /// Called once per content-bearing SSE frame. The charge is a peak
-    /// projection, not a running debt: it is not drawn down as tokens
-    /// arrive, only revised upward if the output overruns the estimate.
+    /// Updates generated token count on streaming frames and adjusts KV projection if output exceeds initial estimate.
     ///
-    /// Strictly greater than, not `>=`: under `output_model = echo` the
-    /// estimate equals the prompt length exactly, so `>=` fires a spurious
-    /// recharge on every single request. (LLD §5.2)
-    ///
-    /// Under `KvModel::PromptOnly` the delta is always zero — the projection
-    /// does not depend on `o_hat` at all. That is correct and intentional;
-    /// do not "fix" it. (LLD §5.2)
+    /// Uses strict inequality (`>`) to prevent spurious recharges when `tokens_seen == o_hat`.
+    /// Under `KvModel::PromptOnly`, the projection delta is zero as expected.
     pub fn observe_tokens(&mut self, n: u32) {
         self.tokens_seen += n;
         if self.tokens_seen > self.o_hat {
@@ -70,7 +66,7 @@ impl CostLease {
         }
     }
 
-    /// Idempotent. Called by Drop.
+    /// Releases reserved inflight slot and KV capacity back to the backend. Idempotent.
     fn release(&mut self) {
         if self.released {
             return;
@@ -88,16 +84,9 @@ impl Drop for CostLease {
     }
 }
 
-/// Debug-build quiescent invariant: when no requests are in-flight, no KV
-/// tokens should be projected.
+/// Asserts the quiescent state invariant: zero inflight requests implies zero projected KV tokens.
 ///
-/// A violation is silent and cumulative — it presents as a backend gradually
-/// receiving less traffic, which is indistinguishable from a genuine
-/// algorithmic result until someone checks the counter. This is the single
-/// most expensive bug available in this project. (LLD §2.2, algorithm spec §13)
-///
-/// Call at the end of integration tests and after draining a run.
-/// Cheaper than a per-lease sum and catches the same class of leak.
+/// Prevents silent lease leaks that cause cumulative routing imbalance.
 #[cfg(debug_assertions)]
 pub fn assert_invariant(backend: &Backend) {
     let inflight = backend.live.inflight.load(Relaxed);
@@ -170,21 +159,18 @@ mod tests {
         );
     }
 
-    /// Strictly greater than, not >=: observing exactly o_hat tokens must not recharge.
     #[test]
     fn recharge_fires_strictly_greater_not_gte() {
         let b = test_backend();
         let mut lease =
             CostLease::open(b.clone(), 100, 10, KvModel::PromptPlusOutput, Instant::now());
         let at_estimate = b.live.kv_projected_tokens.load(Relaxed);
-        // tokens_seen == o_hat (10), not strictly greater — must NOT recharge
         lease.observe_tokens(10);
         assert_eq!(
             b.live.kv_projected_tokens.load(Relaxed),
             at_estimate,
             "observe_tokens at exactly o_hat must not recharge (strictly > rule)"
         );
-        // tokens_seen == 11 > 10 — must recharge now
         lease.observe_tokens(1);
         assert!(
             b.live.kv_projected_tokens.load(Relaxed) > at_estimate,
@@ -226,13 +212,11 @@ mod tests {
         assert_invariant(&b);
     }
 
-    /// assert_invariant must panic when kv_projected is non-zero with inflight==0.
     #[test]
     #[cfg(debug_assertions)]
     fn assert_invariant_fires_on_leaked_state() {
         let b = test_backend();
         b.live.kv_projected_tokens.store(999, Relaxed);
-        // inflight=0, kv_projected=999 → must panic
         let result = std::panic::catch_unwind(|| assert_invariant(&b));
         assert!(
             result.is_err(),

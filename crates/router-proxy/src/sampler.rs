@@ -1,18 +1,16 @@
-//! Periodic occupancy sampling.
+//! Periodic background occupancy sampling.
 //!
-//! The Phase 2 exit criterion has two halves. Error rate is measured by the load
-//! generator, but the mechanism half — "a lower fraction of the run spent at or
-//! above sigma occupancy" — cannot be. The load generator only ever sees one URL
-//! in proxy mode, so `occupancy_stats.py` prints nothing for these runs.
+//! ### Technical Motivation
+//! Sampling backend metrics solely on the active request path is insufficient:
+//! when a backend becomes saturated and the routing policy correctly avoids dispatching to it,
+//! request-path metrics for that backend cease updating and freeze at stale values.
 //!
-//! Sampling on the request path does not work either. `record_occupancy` in the
-//! handler only fires for the backend that was *chosen*, so a backend the policy
-//! correctly stops choosing because it is saturated freezes its gauge at a stale
-//! value. That is precisely the backend whose occupancy the criterion is about.
-//!
-//! This task therefore samples every backend on a fixed wall-clock tick,
-//! independent of traffic, and accumulates two counters per backend. Their ratio
-//! is the fraction of the run that backend spent at or above the ceiling.
+//! ### Periodic Wall-Clock Sampling
+//! To maintain accurate telemetry for all backends regardless of traffic allocation:
+//! - This task runs an asynchronous loop sampling every backend at a fixed wall-clock interval.
+//! - Records live capacity occupancy, in-flight requests, and projected KV tokens.
+//! - Tracks accumulated sample ticks (`ticks_total`) and ticks where occupancy meets or exceeds the admission ceiling `sigma` (`ticks_at_ceiling`).
+//! - The ratio `ticks_at_ceiling / ticks_total` evaluates the fraction of time backends spend at or above safety thresholds.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -23,15 +21,12 @@ use router_core::cost::occupancy;
 use crate::observe;
 use crate::router::RouterState;
 
-/// Sample every backend's occupancy on a fixed tick until the process exits.
+/// Background loop that periodically samples capacity occupancy and live counters for all backends.
 ///
-/// `sigma` is the same ceiling the admission gate filters on, so
-/// `ticks_at_ceiling / ticks_total` answers "how much of the run did this
-/// backend spend in the region the gate was trying to keep it out of".
+/// Evaluates backend occupancy against the safety ceiling `sigma` to track time spent in saturated states.
+/// Configures `MissedTickBehavior::Delay` to prevent catch-up sample bursts from distorting metric ratios after stalls.
 pub async fn sample_occupancy_loop(state: Arc<RouterState>, sigma: f64, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
-    // A missed tick must not cause a burst of catch-up samples: that would
-    // over-weight whatever the occupancy happened to be during the stall.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
