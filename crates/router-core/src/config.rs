@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::cost::{DEFAULT_PENALTY, DEFAULT_SIGMA, DEFAULT_THETA, KvModel};
+use crate::tokens::{TokenCounter, TokenCounterKind};
 
 #[derive(Deserialize)]
 pub struct RawConfig {
@@ -43,6 +44,13 @@ pub struct RawRouting {
     /// Half-life in seconds for the per-route output-length histogram (Phase 2).
     #[serde(default = "default_route_p50_halflife_s")]
     pub route_p50_halflife_s: f64,
+    /// How to count prompt tokens. MUST match what the backend counts: this is the
+    /// numerator of every KV projection, so a mismatch rescales sigma silently.
+    #[serde(default = "default_token_counter")]
+    pub token_counter: TokenCounterKind,
+    /// Divisor for `token_counter = "chars_per_token"`. Ignored otherwise.
+    #[serde(default = "default_chars_per_token")]
+    pub chars_per_token: f64,
 }
 
 fn default_strategy() -> String {
@@ -61,6 +69,14 @@ fn default_trace_sample_rate() -> f64 {
 fn default_route_p50_halflife_s() -> f64 {
     300.0 // 5 minutes, per algorithm spec §11
 }
+fn default_token_counter() -> TokenCounterKind {
+    // Exact for llm-d-inference-sim, and a defensible floor elsewhere. The old
+    // chars/4 default was silently wrong by 1.75x against that backend.
+    TokenCounterKind::Whitespace
+}
+fn default_chars_per_token() -> f64 {
+    4.0
+}
 
 impl Default for RawRouting {
     fn default() -> Self {
@@ -71,6 +87,8 @@ impl Default for RawRouting {
             kv_model: None,
             decision_trace_sample_rate: default_trace_sample_rate(),
             route_p50_halflife_s: default_route_p50_halflife_s(),
+            token_counter: default_token_counter(),
+            chars_per_token: default_chars_per_token(),
         }
     }
 }
@@ -136,6 +154,7 @@ pub struct Config {
     pub kv_model: KvModel,
     pub decision_trace_sample_rate: f64,
     pub route_p50_halflife_s: f64,
+    pub token_counter: TokenCounter,
     pub occupancy_sample_interval_ms: u64,
     pub backends: Vec<RawBackend>,
 }
@@ -154,6 +173,8 @@ pub enum ConfigError {
     NoBackends,
     #[error("occupancy_sample_interval_ms must be > 0")]
     ZeroSampleInterval,
+    #[error("chars_per_token must be finite and > 0, got {0}")]
+    BadCharsPerToken(f64),
     #[error("unknown strategy {0:?} (expected one of: pressure, p2c, least_requests, round_robin, least_kvts)")]
     UnknownStrategy(String),
     #[error("duplicate backend url: {0}")]
@@ -173,6 +194,11 @@ impl RawConfig {
         }
         if self.observability.occupancy_sample_interval_ms == 0 {
             return Err(ConfigError::ZeroSampleInterval);
+        }
+        // Validated even under `whitespace`, so switching modes later cannot
+        // activate a divisor that was never checked.
+        if !(self.routing.chars_per_token.is_finite() && self.routing.chars_per_token > 0.0) {
+            return Err(ConfigError::BadCharsPerToken(self.routing.chars_per_token));
         }
         // Reject an unknown strategy rather than silently falling back. A typo in a
         // comparison config would otherwise run the default policy under the other
@@ -208,6 +234,10 @@ impl RawConfig {
             kv_model: self.routing.kv_model.unwrap_or(KvModel::PromptOnly),
             decision_trace_sample_rate: self.routing.decision_trace_sample_rate,
             route_p50_halflife_s: self.routing.route_p50_halflife_s,
+            token_counter: TokenCounter::new(
+                self.routing.token_counter,
+                self.routing.chars_per_token,
+            ),
             occupancy_sample_interval_ms: self.observability.occupancy_sample_interval_ms,
             backends: self.backends,
         })
@@ -261,6 +291,23 @@ mod tests {
             c.routing.strategy = name.into();
             assert!(c.validate().is_ok(), "{name} must be a valid strategy name");
         }
+    }
+
+    #[test]
+    fn bad_chars_per_token_rejected_even_under_whitespace_mode() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut c = raw(8192, 32);
+            c.routing.chars_per_token = bad;
+            assert!(matches!(c.validate(), Err(ConfigError::BadCharsPerToken(_))),
+                "chars_per_token={bad} must be rejected");
+        }
+    }
+
+    /// The default must be the mode that is exact for the backend in use. A
+    /// chars/4 default silently rescaled sigma by 1.75x.
+    #[test]
+    fn default_token_counter_is_exact() {
+        assert!(raw(8192, 32).validate().unwrap().token_counter.is_exact());
     }
 
     #[test]
