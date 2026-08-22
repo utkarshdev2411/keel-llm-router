@@ -68,6 +68,7 @@ fn params(lease: CostLease, backend: &Arc<Backend>, est: u32) -> BodyParams {
         upstream_status: hyper::StatusCode::OK,
         route: RouteKey(backend.model.clone(), 64),
         route_hists: Arc::new(RouteHistograms::new(300.0)),
+            estimated_prompt_tokens: 100,
     }
 }
 
@@ -95,7 +96,8 @@ async fn byte_at_a_time_token_count_reconciles_with_usage() {
     let inner = StreamBody::new(futures_util::stream::iter(byte_frames(stream)));
     let mut body = CountingSseBody::new(
         inner,
-        BodyParams { route: route.clone(), route_hists: hists.clone(), ..params(lease, &backend, 10) },
+        BodyParams { route: route.clone(), route_hists: hists.clone(),
+                estimated_prompt_tokens: 100, ..params(lease, &backend, 10) },
     );
     drain(&mut body).await;
 

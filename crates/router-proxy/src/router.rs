@@ -18,6 +18,7 @@ use router_core::backend::Snapshot;
 use router_core::cost::{occupancy, KvModel};
 use router_core::lease::CostLease;
 use router_core::strategy::RoutingStrategy;
+use router_core::tokens::TokenCounter;
 use router_core::trace::DecisionTrace;
 
 use crate::inbound;
@@ -38,6 +39,8 @@ pub struct RouterState {
     pub kv_model: KvModel,
     /// Shared per-route output length estimator providing completion token estimates `ô`.
     pub route_hists: Arc<RouteHistograms>,
+    /// Must match the backend's tokenization; see router_core::tokens.
+    pub token_counter: TokenCounter,
 }
 
 /// Top-level hyper HTTP request entrypoint.
@@ -65,8 +68,13 @@ async fn handle_inner(
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
 
     // Extract request features (model, prompt tokens, max_tokens, etc.).
-    let features = inbound::build_features(&body_bytes, now, &state.route_hists)
+    let features = inbound::build_features(&body_bytes, now, &state.route_hists, &state.token_counter)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // The backend only emits ground-truth token counts (for the drift audit and the
+    // route histogram feedback loop) when the request asks for them explicitly.
+    // See inbound::ensure_usage_requested for why this is necessary at all.
+    let body_bytes = inbound::ensure_usage_requested(body_bytes, features.streaming);
 
     let snap = state.snapshot.load();
     if snap.healthy.is_empty() {
@@ -160,6 +168,7 @@ async fn handle_inner(
             upstream_status: resp_parts.status,
             route: length_estimator::route_key_for(&features),
             route_hists: state.route_hists.clone(),
+            estimated_prompt_tokens: features.prompt_tokens,
         },
     );
 

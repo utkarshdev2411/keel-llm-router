@@ -37,7 +37,14 @@ pub fn rebuild_request(
 
     let mut builder = Request::builder().method(parts.method.clone()).uri(uri);
     for (name, value) in parts.headers.iter() {
-        if name == hyper::header::HOST {
+        // HOST is being retargeted to the backend. CONTENT_LENGTH is dropped and
+        // recomputed by hyper from `body`'s actual length: `body` here is not
+        // necessarily byte-identical to what the client sent -- see
+        // `inbound::ensure_usage_requested`, which grows it -- and forwarding the
+        // client's original length produces a request the backend truncates while
+        // parsing, surfacing as an opaque "unexpected end of JSON input". Found by
+        // running real traffic through this exact path.
+        if name == hyper::header::HOST || name == hyper::header::CONTENT_LENGTH {
             continue;
         }
         builder = builder.header(name, value);
@@ -72,6 +79,8 @@ pin_project! {
         saw_error_frame: bool,
         route: RouteKey,
         route_hists: Arc<RouteHistograms>,
+        // The router's own prompt count, kept so the usage frame can audit it.
+        estimated_prompt_tokens: u32,
     }
 
     impl<B> PinnedDrop for CountingSseBody<B> {
@@ -96,6 +105,7 @@ pub struct BodyParams {
     pub upstream_status: hyper::StatusCode,
     pub route: RouteKey,
     pub route_hists: Arc<RouteHistograms>,
+    pub estimated_prompt_tokens: u32,
 }
 
 impl<B> CountingSseBody<B> {
@@ -114,6 +124,7 @@ impl<B> CountingSseBody<B> {
             saw_error_frame: false,
             route: p.route,
             route_hists: p.route_hists,
+            estimated_prompt_tokens: p.estimated_prompt_tokens,
         }
     }
 }
@@ -158,7 +169,16 @@ where
                                             *this.first_token_at = Some(Instant::now());
                                         }
                                     }
-                                    Some(sse::Frame::Usage { completion_tokens }) => {
+                                    Some(sse::Frame::Usage {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                    }) => {
+                                        // Audit the projection against the backend's
+                                        // own count. See tokens.rs for why.
+                                        observe::record_prompt_token_ratio(
+                                            *this.estimated_prompt_tokens,
+                                            prompt_tokens,
+                                        );
                                         observe::record_output_length_ratio(
                                             *this.estimated_output_tokens,
                                             completion_tokens,
@@ -226,6 +246,34 @@ mod tests {
     use router_core::lease::CostLease;
     use std::sync::atomic::Ordering::Relaxed;
 
+    /// A rewritten body must never travel with the client's original
+    /// Content-Length: growing the body (see `inbound::ensure_usage_requested`)
+    /// while keeping the old length produces a request the backend truncates
+    /// mid-parse. Caught by running real traffic through this path, not by any
+    /// existing unit test -- this pins it down.
+    #[test]
+    fn stale_content_length_is_dropped_when_body_is_rewritten() {
+        let short_body = Bytes::from_static(br#"{"a":1}"#);
+        let long_body = Bytes::from_static(br#"{"a":1,"stream_options":{"include_usage":true}}"#);
+        assert!(long_body.len() > short_body.len());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://client/v1/chat/completions")
+            .header(hyper::header::CONTENT_LENGTH, short_body.len())
+            .header(hyper::header::HOST, "client")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+
+        let rebuilt = rebuild_request(&parts, long_body.clone(), "http://backend:9000").unwrap();
+        let cl = rebuilt.headers().get(hyper::header::CONTENT_LENGTH);
+        assert!(
+            cl.is_none() || cl.unwrap().to_str().unwrap() == long_body.len().to_string(),
+            "forwarded Content-Length must not be the pre-rewrite length"
+        );
+    }
+
     fn test_backend() -> Arc<Backend> {
         Arc::new(Backend {
             id: BackendId(0),
@@ -249,6 +297,7 @@ mod tests {
             upstream_status: hyper::StatusCode::OK,
             route: RouteKey(backend.model.clone(), 64),
             route_hists: Arc::new(RouteHistograms::new(300.0)),
+            estimated_prompt_tokens: 100,
         }
     }
 
@@ -392,6 +441,7 @@ mod tests {
                 upstream_status: hyper::StatusCode::OK,
                 route: route.clone(),
                 route_hists: hists.clone(),
+                estimated_prompt_tokens: 100,
             },
         );
 

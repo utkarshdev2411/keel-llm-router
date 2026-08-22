@@ -76,6 +76,14 @@ pub fn describe_metrics() {
 
     // --- Estimation accuracy & drift metrics ---
     metrics::describe_histogram!(
+        "router_prompt_token_ratio",
+        "Router's prompt-token count divided by the backend's reported \
+         usage.prompt_tokens. MUST sit at 1.0. Any other value means the configured \
+         token_counter does not match what the backend counts, which rescales the \
+         admission ceiling by exactly that factor: a ratio of 1.75 turns sigma=0.95 \
+         into an effective 0.54."
+    );
+    metrics::describe_histogram!(
         "router_output_length_ratio",
         "Ratio of estimated to actual completion tokens (`estimated / completion_tokens`). \
          Ratios near 1.0 indicate accurate output length estimation."
@@ -153,6 +161,58 @@ pub fn record_decision_duration(strategy: &str, seconds: f64) {
 /// Records end-to-end pre-dispatch processing overhead to `router_overhead_seconds`.
 pub fn record_router_overhead(seconds: f64) {
     metrics::histogram!("router_overhead_seconds").record(seconds);
+}
+
+/// Compare the router's prompt-token count against the backend's own, and shout
+/// once if they systematically disagree.
+///
+/// This guards the failure that invalidated a whole benchmark run: a `chars / 4`
+/// count against a word-counting backend read 1.75x high, silently turning
+/// `sigma = 0.95` into an effective 0.54 and leaving 46% of KV capacity unused.
+/// Nothing errored. The only symptom was a saturated_dispatches counter sitting at
+/// 93%, in a file nobody was obliged to read.
+///
+/// Warns on the running mean, not any single request, so one odd prompt cannot cry
+/// wolf; and warns exactly once, because this is a static misconfiguration rather
+/// than an event.
+pub fn record_prompt_token_ratio(estimated: u32, reported: u32) {
+    if reported == 0 {
+        return; // Backend did not report a count; nothing to compare against.
+    }
+    let ratio = estimated as f64 / reported as f64;
+    metrics::histogram!("router_prompt_token_ratio").record(ratio);
+
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+    static SUM_MILLI: AtomicU64 = AtomicU64::new(0);
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    const MIN_SAMPLES: u64 = 50;
+    const TOLERANCE: f64 = 0.10;
+
+    let milli = (ratio * 1000.0).round() as u64;
+    let n = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    let sum = SUM_MILLI.fetch_add(milli, Ordering::Relaxed) + milli;
+
+    if n < MIN_SAMPLES || WARNED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mean = sum as f64 / 1000.0 / n as f64;
+    if (mean - 1.0).abs() > TOLERANCE
+        && WARNED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::error!(
+            mean_ratio = mean,
+            samples = n,
+            "TOKEN COUNT MISMATCH: the router counts {mean:.2}x the prompt tokens the \
+             backend reports. Every KV projection is wrong by this factor, so the \
+             effective admission ceiling is sigma/{mean:.2}, not sigma. Fix \
+             `token_counter` in the router config before trusting any result from \
+             this process."
+        );
+    }
 }
 
 /// Records the ratio of estimated to actual completion tokens upon request stream completion.

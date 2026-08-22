@@ -4,7 +4,7 @@ pub enum Frame<'a> {
     RoleHeader,
     Content { text: &'a str },
     EmptyContent,
-    Usage { completion_tokens: u32 },
+    Usage { prompt_tokens: u32, completion_tokens: u32 },
     Error { message: &'a str },
     Done,
 }
@@ -41,12 +41,19 @@ pub fn classify(parsed: &ParsedLine) -> Option<Frame<'_>> {
 
     let choices = v.get("choices")?.as_array()?;
     if choices.is_empty() {
-        let completion_tokens = v
-            .get("usage")
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0) as u32;
-        return Some(Frame::Usage { completion_tokens });
+        let usage = v.get("usage");
+        let field = |name: &str| {
+            usage
+                .and_then(|u| u.get(name))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0) as u32
+        };
+        // prompt_tokens is the backend's own count, and the only ground truth the
+        // router ever sees for its projection. See tokens.rs.
+        return Some(Frame::Usage {
+            prompt_tokens: field("prompt_tokens"),
+            completion_tokens: field("completion_tokens"),
+        });
     }
 
     let delta = choices[0].get("delta")?;
@@ -87,7 +94,7 @@ mod tests {
     fn classifies_usage_frame() {
         let p = classify_str(r#"{"choices":[],"usage":{"completion_tokens":42}}"#).unwrap();
         match classify(&p) {
-            Some(Frame::Usage { completion_tokens }) => assert_eq!(completion_tokens, 42),
+            Some(Frame::Usage { completion_tokens, .. }) => assert_eq!(completion_tokens, 42),
             _ => panic!("expected usage frame"),
         }
     }
@@ -128,7 +135,7 @@ mod tests {
             let p = parse_line(l).unwrap();
             match classify(&p) {
                 Some(Frame::Content { .. }) => counted += 1,
-                Some(Frame::Usage { completion_tokens }) => usage_tokens = completion_tokens,
+                Some(Frame::Usage { completion_tokens, .. }) => usage_tokens = completion_tokens,
                 Some(Frame::Error { .. }) => had_error = true,
                 _ => {}
             }

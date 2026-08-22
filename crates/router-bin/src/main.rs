@@ -66,7 +66,12 @@ fn main() -> anyhow::Result<()> {
         }),
         other => anyhow::bail!("unknown strategy {other:?}"),
     };
-    tracing::info!(strategy = strategy.name(), kv_model = ?kv_model, "starting router");
+    tracing::info!(
+        strategy = strategy.name(),
+        kv_model = ?kv_model,
+        token_counter = ?config.token_counter.kind(),
+        "starting router"
+    );
 
     let state = Arc::new(RouterState {
         snapshot: ArcSwap::from_pointee(snapshot),
@@ -78,6 +83,7 @@ fn main() -> anyhow::Result<()> {
         route_hists: Arc::new(router_proxy::length_estimator::RouteHistograms::new(
             config.route_p50_halflife_s,
         )),
+        token_counter: config.token_counter,
     });
 
     let runtime = tokio::runtime::Runtime::new()?;
