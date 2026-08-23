@@ -92,7 +92,18 @@ for ARM in pressure p2c; do
         tail -20 "/tmp/router_${ARM}_${K}.log"
         exit 1
       fi
-      if curl -s --max-time 1 -o /dev/null "http://127.0.0.1:8080/v1/models"; then
+      # Admin port confirms the process is alive and config loaded -- it binds
+      # synchronously before the traffic listener does. Traffic port readiness
+      # is a bare TCP connect probe, not an HTTP request: curling 8080 would
+      # hit the real handler, fail JSON parsing on an empty GET, and increment
+      # router_requests_total{result="error"} by one -- which then trips the
+      # freshness check below on the router's own health check. Found live:
+      # "1 requests already served" on a router that had not yet served any
+      # real traffic.
+      admin_ok=0; port_ok=0
+      curl -s --max-time 1 -o /dev/null "$ADMIN" && admin_ok=1
+      (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && { exec 3>&-; port_ok=1; }
+      if [ "$admin_ok" -eq 1 ] && [ "$port_ok" -eq 1 ]; then
         ready=1; break
       fi
       sleep 1
