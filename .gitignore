@@ -11,6 +11,13 @@ Load-Balancer/
 .obsidian/
 
 # ---------------------------------------------------------------------------
+# Kiro (development agent). Specs, task state, and local config it generates
+# under .kiro/ are working state for that tool, not project source -- same
+# category as .obsidian/ above. Never committed.
+# ---------------------------------------------------------------------------
+.kiro/
+
+# ---------------------------------------------------------------------------
 # Generated data from phase0 runs. Nothing produced by a run belongs in version
 # control: traces rebuild from a seed, results rebuild from traces, and traces
 # are ~4.5 MB each. Committing results also publishes raw measurements.
