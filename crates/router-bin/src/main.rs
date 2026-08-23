@@ -6,6 +6,7 @@ use router_core::config::RawConfig;
 use router_core::strategy::{LeastKvts, LeastRequests, P2c, Pressure, RoundRobin, RoutingStrategy};
 use router_proxy::observe;
 use router_proxy::router::RouterState;
+use router_proxy::signal::{SignalConfig, spawn_collectors};
 use router_proxy::upstream;
 
 fn main() -> anyhow::Result<()> {
@@ -86,7 +87,23 @@ fn main() -> anyhow::Result<()> {
         token_counter: config.token_counter,
     });
 
+    let signal_cfg = SignalConfig {
+        enabled: config.signal.enabled,
+        scrape_interval: config.signal.scrape_interval,
+        scrape_timeout: config.signal.scrape_timeout,
+        max_signal_age: config.signal.max_signal_age,
+        drift_warn_ratio: config.signal.drift_warn_ratio,
+        validate_capacity_at_startup: config.signal.validate_capacity_at_startup,
+    };
+
     let runtime = tokio::runtime::Runtime::new()?;
+
+    // Startup capacity assertion — runs synchronously before accepting traffic.
+    if signal_cfg.validate_capacity_at_startup {
+        let backends_ref = state.snapshot.load();
+        let assertion_timeout = signal_cfg.scrape_timeout + std::time::Duration::from_millis(500);
+        runtime.block_on(validate_backend_capacities(&backends_ref.backends, assertion_timeout))?;
+    }
 
     let sample_interval = std::time::Duration::from_millis(config.occupancy_sample_interval_ms);
     runtime.spawn(router_proxy::sampler::sample_occupancy_loop(
@@ -95,7 +112,110 @@ fn main() -> anyhow::Result<()> {
         sample_interval,
     ));
 
+    // Spawn one signal collector task per backend. Hold handles alive for process lifetime.
+    let _signal_handles = spawn_collectors(state.clone(), signal_cfg);
+
     runtime.block_on(router_proxy::listener::serve(&config.listener_bind, state))?;
+
+    Ok(())
+}
+
+/// Scrape each backend once at startup and assert that its self-reported KV capacity
+/// matches the router config.
+///
+/// `kv_capacity_tokens = block_size * num_gpu_blocks` is the denominator of every
+/// occupancy calculation. A mismatch rescales sigma silently, exactly like the
+/// 1.75x token-count bug did. This catches it at startup rather than in a benchmark.
+///
+/// * Match     → info!, proceed
+/// * Mismatch  → hard error, refuse to start
+/// * Unreachable / metric absent → warn!, proceed (observability outage ≠ misconfiguration)
+async fn validate_backend_capacities(
+    backends: &[Arc<Backend>],
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use router_proxy::signal::scrape::parse_capacity;
+
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default();
+
+    let mut any_mismatch = false;
+
+    for backend in backends {
+        let metrics_url = format!("{}/metrics", backend.uri.trim_end_matches('/'));
+
+        let result = tokio::time::timeout(timeout, client.get(&metrics_url).send()).await;
+
+        match result {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(text) => match parse_capacity(&text) {
+                    Some(cap) => {
+                        let expected = cap.block_size * cap.num_gpu_blocks;
+                        let configured = backend.caps.kv_capacity_tokens;
+                        if expected == configured {
+                            tracing::info!(
+                                backend = %backend.key,
+                                capacity = expected,
+                                block_size = cap.block_size,
+                                num_gpu_blocks = cap.num_gpu_blocks,
+                                "capacity assertion passed"
+                            );
+                        } else {
+                            tracing::error!(
+                                backend = %backend.key,
+                                backend_reports = expected,
+                                config_has = configured,
+                                block_size = cap.block_size,
+                                num_gpu_blocks = cap.num_gpu_blocks,
+                                "CAPACITY MISMATCH: backend reports {expected} tokens \
+                                 (block_size={} * num_gpu_blocks={}), but config has \
+                                 kv_tokens={configured}. Every occupancy fraction is wrong \
+                                 by this factor. Fix kv_tokens in the router config.",
+                                cap.block_size, cap.num_gpu_blocks
+                            );
+                            any_mismatch = true;
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            backend = %backend.key,
+                            "capacity assertion skipped: cache_config_info metric absent from /metrics"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        backend = %backend.key,
+                        error = %e,
+                        "capacity assertion skipped: failed to read /metrics body"
+                    );
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    backend = %backend.key,
+                    error = %e,
+                    "capacity assertion skipped: /metrics unreachable"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    backend = %backend.key,
+                    "capacity assertion skipped: /metrics timed out"
+                );
+            }
+        }
+    }
+
+    if any_mismatch {
+        anyhow::bail!(
+            "one or more backends reported a KV capacity that does not match \
+             the router config. See the CAPACITY MISMATCH log lines above. \
+             Fix kv_tokens in the router config before starting."
+        );
+    }
 
     Ok(())
 }

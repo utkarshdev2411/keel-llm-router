@@ -24,6 +24,7 @@ metrics-exporter-prometheus = { workspace = true }
 bytes = "1"
 http-body = "1"
 pin-project-lite = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 wiremock = "0.6"
