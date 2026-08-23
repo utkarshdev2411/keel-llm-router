@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -14,6 +15,8 @@ pub struct RawConfig {
     pub admission: RawAdmission,
     #[serde(default)]
     pub observability: RawObservability,
+    #[serde(default)]
+    pub signal: RawSignal,
     pub backends: Vec<RawBackend>,
 }
 
@@ -130,6 +133,54 @@ impl Default for RawObservability {
 }
 
 #[derive(Deserialize)]
+pub struct RawSignal {
+    #[serde(default = "default_signal_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_scrape_interval_ms")]
+    pub scrape_interval_ms: u64,
+    #[serde(default = "default_scrape_timeout_ms")]
+    pub scrape_timeout_ms: u64,
+    #[serde(default = "default_max_signal_age_ms")]
+    pub max_signal_age_ms: u64,
+    #[serde(default = "default_drift_warn_ratio")]
+    pub drift_warn_ratio: f64,
+    #[serde(default = "default_validate_capacity")]
+    pub validate_capacity_at_startup: bool,
+}
+
+fn default_signal_enabled() -> bool {
+    true
+}
+fn default_scrape_interval_ms() -> u64 {
+    1000
+}
+fn default_scrape_timeout_ms() -> u64 {
+    500
+}
+fn default_max_signal_age_ms() -> u64 {
+    5000
+}
+fn default_drift_warn_ratio() -> f64 {
+    2.0
+}
+fn default_validate_capacity() -> bool {
+    true
+}
+
+impl Default for RawSignal {
+    fn default() -> Self {
+        Self {
+            enabled: default_signal_enabled(),
+            scrape_interval_ms: default_scrape_interval_ms(),
+            scrape_timeout_ms: default_scrape_timeout_ms(),
+            max_signal_age_ms: default_max_signal_age_ms(),
+            drift_warn_ratio: default_drift_warn_ratio(),
+            validate_capacity_at_startup: default_validate_capacity(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct RawBackend {
     pub url: String,
     pub model: String,
@@ -156,7 +207,17 @@ pub struct Config {
     pub route_p50_halflife_s: f64,
     pub token_counter: TokenCounter,
     pub occupancy_sample_interval_ms: u64,
+    pub signal: SignalConfig,
     pub backends: Vec<RawBackend>,
+}
+
+pub struct SignalConfig {
+    pub enabled: bool,
+    pub scrape_interval: Duration,
+    pub scrape_timeout: Duration,
+    pub max_signal_age: Duration,
+    pub drift_warn_ratio: f64,
+    pub validate_capacity_at_startup: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -179,6 +240,14 @@ pub enum ConfigError {
     UnknownStrategy(String),
     #[error("duplicate backend url: {0}")]
     DuplicateBackend(String),
+    #[error("signal: scrape_timeout_ms must be strictly less than scrape_interval_ms, got timeout={0}ms >= interval={1}ms")]
+    SignalTimeoutNotLessThanInterval(u64, u64),
+    #[error("signal: scrape_timeout_ms and scrape_interval_ms must be > 0, got timeout={0}ms, interval={1}ms")]
+    SignalTimeoutsNotPositive(u64, u64),
+    #[error("signal: max_signal_age_ms must be >= scrape_interval_ms, got age={0}ms < interval={1}ms")]
+    SignalAgeBeforeInterval(u64, u64),
+    #[error("signal: drift_warn_ratio must be > 1.0, got {0}")]
+    SignalDriftRatioTooLow(f64),
 }
 
 impl RawConfig {
@@ -210,6 +279,29 @@ impl RawConfig {
             return Err(ConfigError::UnknownStrategy(self.routing.strategy.clone()));
         }
 
+        // Signal plane validation
+        if self.signal.scrape_timeout_ms == 0 || self.signal.scrape_interval_ms == 0 {
+            return Err(ConfigError::SignalTimeoutsNotPositive(
+                self.signal.scrape_timeout_ms,
+                self.signal.scrape_interval_ms,
+            ));
+        }
+        if self.signal.scrape_timeout_ms >= self.signal.scrape_interval_ms {
+            return Err(ConfigError::SignalTimeoutNotLessThanInterval(
+                self.signal.scrape_timeout_ms,
+                self.signal.scrape_interval_ms,
+            ));
+        }
+        if self.signal.max_signal_age_ms < self.signal.scrape_interval_ms {
+            return Err(ConfigError::SignalAgeBeforeInterval(
+                self.signal.max_signal_age_ms,
+                self.signal.scrape_interval_ms,
+            ));
+        }
+        if self.signal.drift_warn_ratio <= 1.0 {
+            return Err(ConfigError::SignalDriftRatioTooLow(self.signal.drift_warn_ratio));
+        }
+
         let mut seen = HashSet::new();
         for b in &self.backends {
             if b.kv_tokens == 0 {
@@ -239,6 +331,14 @@ impl RawConfig {
                 self.routing.chars_per_token,
             ),
             occupancy_sample_interval_ms: self.observability.occupancy_sample_interval_ms,
+            signal: SignalConfig {
+                enabled: self.signal.enabled,
+                scrape_interval: Duration::from_millis(self.signal.scrape_interval_ms),
+                scrape_timeout: Duration::from_millis(self.signal.scrape_timeout_ms),
+                max_signal_age: Duration::from_millis(self.signal.max_signal_age_ms),
+                drift_warn_ratio: self.signal.drift_warn_ratio,
+                validate_capacity_at_startup: self.signal.validate_capacity_at_startup,
+            },
             backends: self.backends,
         })
     }
@@ -258,6 +358,7 @@ mod tests {
             routing: RawRouting::default(),
             admission: RawAdmission::default(),
             observability: RawObservability::default(),
+            signal: RawSignal::default(),
             backends: vec![RawBackend {
                 url: "http://a:8000".into(),
                 model: "m".into(),
@@ -337,5 +438,98 @@ mod tests {
         let mut r2 = raw(8192, 32);
         r2.admission.sigma = 0.0;
         assert!(matches!(r2.validate(), Err(ConfigError::SigmaOutOfRange(_))));
+    }
+
+    #[test]
+    fn signal_timeout_not_less_than_interval_rejected() {
+        let mut r = raw(8192, 32);
+        r.signal.scrape_timeout_ms = 1000;
+        r.signal.scrape_interval_ms = 1000;
+        assert!(matches!(
+            r.validate(),
+            Err(ConfigError::SignalTimeoutNotLessThanInterval(1000, 1000))
+        ));
+
+        let mut r2 = raw(8192, 32);
+        r2.signal.scrape_timeout_ms = 1500;
+        r2.signal.scrape_interval_ms = 1000;
+        assert!(matches!(
+            r2.validate(),
+            Err(ConfigError::SignalTimeoutNotLessThanInterval(1500, 1000))
+        ));
+    }
+
+    #[test]
+    fn signal_timeouts_not_positive_rejected() {
+        let mut r = raw(8192, 32);
+        r.signal.scrape_timeout_ms = 0;
+        r.signal.scrape_interval_ms = 1000;
+        assert!(matches!(
+            r.validate(),
+            Err(ConfigError::SignalTimeoutsNotPositive(0, 1000))
+        ));
+
+        let mut r2 = raw(8192, 32);
+        r2.signal.scrape_timeout_ms = 500;
+        r2.signal.scrape_interval_ms = 0;
+        assert!(matches!(
+            r2.validate(),
+            Err(ConfigError::SignalTimeoutsNotPositive(500, 0))
+        ));
+    }
+
+    #[test]
+    fn signal_age_before_interval_rejected() {
+        let mut r = raw(8192, 32);
+        r.signal.max_signal_age_ms = 500;
+        r.signal.scrape_interval_ms = 1000;
+        assert!(matches!(
+            r.validate(),
+            Err(ConfigError::SignalAgeBeforeInterval(500, 1000))
+        ));
+    }
+
+    #[test]
+    fn signal_drift_ratio_too_low_rejected() {
+        let mut r = raw(8192, 32);
+        r.signal.drift_warn_ratio = 1.0;
+        assert!(matches!(
+            r.validate(),
+            Err(ConfigError::SignalDriftRatioTooLow(1.0))
+        ));
+
+        let mut r2 = raw(8192, 32);
+        r2.signal.drift_warn_ratio = 0.5;
+        assert!(matches!(
+            r2.validate(),
+            Err(ConfigError::SignalDriftRatioTooLow(0.5))
+        ));
+    }
+
+    #[test]
+    fn signal_valid_config_passes() {
+        let mut r = raw(8192, 32);
+        r.signal.scrape_timeout_ms = 500;
+        r.signal.scrape_interval_ms = 1000;
+        r.signal.max_signal_age_ms = 5000;
+        r.signal.drift_warn_ratio = 2.0;
+        let cfg = r.validate().unwrap();
+        assert_eq!(cfg.signal.scrape_timeout.as_millis(), 500);
+        assert_eq!(cfg.signal.scrape_interval.as_millis(), 1000);
+        assert_eq!(cfg.signal.max_signal_age.as_millis(), 5000);
+        assert_eq!(cfg.signal.drift_warn_ratio, 2.0);
+        assert!(cfg.signal.enabled);
+        assert!(cfg.signal.validate_capacity_at_startup);
+    }
+
+    #[test]
+    fn signal_default_values() {
+        let cfg = raw(8192, 32).validate().unwrap();
+        assert_eq!(cfg.signal.scrape_timeout.as_millis(), 500);
+        assert_eq!(cfg.signal.scrape_interval.as_millis(), 1000);
+        assert_eq!(cfg.signal.max_signal_age.as_millis(), 5000);
+        assert_eq!(cfg.signal.drift_warn_ratio, 2.0);
+        assert!(cfg.signal.enabled);
+        assert!(cfg.signal.validate_capacity_at_startup);
     }
 }
