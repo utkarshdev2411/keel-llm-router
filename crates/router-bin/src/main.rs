@@ -139,75 +139,66 @@ async fn validate_backend_capacities(
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     use router_proxy::signal::scrape::parse_capacity;
+    use router_proxy::signal::ScrapeError;
+    use router_proxy::upstream;
 
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .unwrap_or_default();
+    // Same pooled client the request path and the signal collectors use --
+    // no separate HTTP stack, no separate TLS dependency, for one plaintext
+    // GET at startup.
+    let client = upstream::build_client();
 
     let mut any_mismatch = false;
 
     for backend in backends {
         let metrics_url = format!("{}/metrics", backend.uri.trim_end_matches('/'));
 
-        let result = tokio::time::timeout(timeout, client.get(&metrics_url).send()).await;
-
-        match result {
-            Ok(Ok(resp)) => match resp.text().await {
-                Ok(text) => match parse_capacity(&text) {
-                    Some(cap) => {
-                        let expected = cap.block_size * cap.num_gpu_blocks;
-                        let configured = backend.caps.kv_capacity_tokens;
-                        if expected == configured {
-                            tracing::info!(
-                                backend = %backend.key,
-                                capacity = expected,
-                                block_size = cap.block_size,
-                                num_gpu_blocks = cap.num_gpu_blocks,
-                                "capacity assertion passed"
-                            );
-                        } else {
-                            tracing::error!(
-                                backend = %backend.key,
-                                backend_reports = expected,
-                                config_has = configured,
-                                block_size = cap.block_size,
-                                num_gpu_blocks = cap.num_gpu_blocks,
-                                "CAPACITY MISMATCH: backend reports {expected} tokens \
-                                 (block_size={} * num_gpu_blocks={}), but config has \
-                                 kv_tokens={configured}. Every occupancy fraction is wrong \
-                                 by this factor. Fix kv_tokens in the router config.",
-                                cap.block_size, cap.num_gpu_blocks
-                            );
-                            any_mismatch = true;
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
+        match router_proxy::signal::fetch_metrics(&client, &metrics_url, timeout).await {
+            Ok(text) => match parse_capacity(&text) {
+                Some(cap) => {
+                    let expected = cap.block_size * cap.num_gpu_blocks;
+                    let configured = backend.caps.kv_capacity_tokens;
+                    if expected == configured {
+                        tracing::info!(
                             backend = %backend.key,
-                            "capacity assertion skipped: cache_config_info metric absent from /metrics"
+                            capacity = expected,
+                            block_size = cap.block_size,
+                            num_gpu_blocks = cap.num_gpu_blocks,
+                            "capacity assertion passed"
                         );
+                    } else {
+                        tracing::error!(
+                            backend = %backend.key,
+                            backend_reports = expected,
+                            config_has = configured,
+                            block_size = cap.block_size,
+                            num_gpu_blocks = cap.num_gpu_blocks,
+                            "CAPACITY MISMATCH: backend reports {expected} tokens \
+                             (block_size={} * num_gpu_blocks={}), but config has \
+                             kv_tokens={configured}. Every occupancy fraction is wrong \
+                             by this factor. Fix kv_tokens in the router config.",
+                            cap.block_size, cap.num_gpu_blocks
+                        );
+                        any_mismatch = true;
                     }
-                },
-                Err(e) => {
+                }
+                None => {
                     tracing::warn!(
                         backend = %backend.key,
-                        error = %e,
-                        "capacity assertion skipped: failed to read /metrics body"
+                        "capacity assertion skipped: cache_config_info metric absent from /metrics"
                     );
                 }
             },
-            Ok(Err(e)) => {
+            Err(ScrapeError::Timeout) => {
+                tracing::warn!(
+                    backend = %backend.key,
+                    "capacity assertion skipped: /metrics timed out"
+                );
+            }
+            Err(e) => {
                 tracing::warn!(
                     backend = %backend.key,
                     error = %e,
                     "capacity assertion skipped: /metrics unreachable"
-                );
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    backend = %backend.key,
-                    "capacity assertion skipped: /metrics timed out"
                 );
             }
         }

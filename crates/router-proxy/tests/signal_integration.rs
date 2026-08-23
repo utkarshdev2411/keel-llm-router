@@ -79,18 +79,11 @@ async fn m1_collector_populates_reported() {
     let backend = make_backend(&server.uri());
     assert!(backend.reported.load().is_none(), "precondition: reported starts empty");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
+    let client = router_proxy::upstream::build_client();
+    let metrics_url = format!("{}/metrics", server.uri());
 
-    // Run one scrape cycle directly via the scrape logic.
-    let text = client
-        .get(format!("{}/metrics", server.uri()))
-        .send()
-        .await
-        .unwrap()
-        .text()
+    // Run one scrape cycle through the actual production fetch path.
+    let text = router_proxy::signal::fetch_metrics(&client, &metrics_url, Duration::from_secs(2))
         .await
         .unwrap();
 
@@ -279,17 +272,10 @@ async fn m6_capacity_mismatch_refuses_startup() {
     let backend = make_backend(&server.uri());
     // backend.caps.kv_capacity_tokens = 8192 (from make_backend)
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
+    let client = router_proxy::upstream::build_client();
+    let metrics_url = format!("{}/metrics", server.uri());
 
-    let text = client
-        .get(format!("{}/metrics", server.uri()))
-        .send()
-        .await
-        .unwrap()
-        .text()
+    let text = router_proxy::signal::fetch_metrics(&client, &metrics_url, Duration::from_secs(2))
         .await
         .unwrap();
 
@@ -313,12 +299,13 @@ async fn m6_capacity_mismatch_refuses_startup() {
 #[tokio::test]
 async fn m7_capacity_unreachable_warns_only() {
     // Use a port nothing listens on
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(100))
-        .build()
-        .unwrap();
-
-    let result = client.get("http://127.0.0.1:19998/metrics").send().await;
+    let client = router_proxy::upstream::build_client();
+    let result = router_proxy::signal::fetch_metrics(
+        &client,
+        "http://127.0.0.1:19998/metrics",
+        Duration::from_millis(200),
+    )
+    .await;
 
     // The request must fail (connection refused or timeout)
     assert!(
