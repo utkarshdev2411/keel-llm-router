@@ -43,6 +43,23 @@ kill_router() {
 }
 trap kill_router EXIT
 
+# A router left over from an earlier session is the single most dangerous failure
+# here. It keeps answering on 8080, so the readiness poll below is satisfied, while
+# every router this script starts dies on the fatal admin-port bind. The whole
+# comparison then runs against one stale process with one strategy, and both arms
+# report identical numbers that look like a legitimate tie.
+echo "=== clearing any router left over from a previous run ==="
+pkill -f "$ROOT/target/release/router" 2>/dev/null || true
+for _ in $(seq 1 20); do
+  if ! ss -ltn 2>/dev/null | grep -qE ':(8080|9090)\s'; then break; fi
+  sleep 0.5
+done
+if ss -ltn 2>/dev/null | grep -qE ':(8080|9090)\s'; then
+  echo "ABORT: ports 8080/9090 are still held by something this script did not start."
+  ss -ltnp 2>/dev/null | grep -E ':(8080|9090)\s'
+  exit 1
+fi
+
 echo "=== building router (foreground; must finish before any traffic) ==="
 cargo build --release
 
@@ -68,6 +85,13 @@ for ARM in pressure p2c; do
 
     ready=0
     for _ in $(seq 1 30); do
+      # A dead router must fail fast rather than let the poll time out against
+      # whatever else might be answering on 8080.
+      if ! kill -0 "$ROUTER_PID" 2>/dev/null; then
+        echo "    router process exited during startup -- see /tmp/router_${ARM}_${K}.log"
+        tail -20 "/tmp/router_${ARM}_${K}.log"
+        exit 1
+      fi
       if curl -s --max-time 1 -o /dev/null "http://127.0.0.1:8080/v1/models"; then
         ready=1; break
       fi
@@ -76,6 +100,19 @@ for ARM in pressure p2c; do
     if [ "$ready" -ne 1 ]; then
       echo "    router did not come up -- see /tmp/router_${ARM}_${K}.log"
       tail -20 "/tmp/router_${ARM}_${K}.log"
+      exit 1
+    fi
+
+    # Freshness assertion. If the counters are non-zero before a single request has
+    # been sent, we are scraping a router that already served traffic -- i.e. not
+    # the one just started -- and every number from this run would be a blend of
+    # two arms. This is a hard abort, not a warning.
+    PRIOR=$(curl -s --max-time 2 "$ADMIN" \
+            | awk '/^router_requests_total\{/ {s+=$2} END {printf "%d", s+0}')
+    if [ "${PRIOR:-0}" -ne 0 ]; then
+      echo "ABORT: admin endpoint reports $PRIOR requests already served before this run."
+      echo "       The router being scraped is not the one just started. Kill all"
+      echo "       stray routers and rerun."
       exit 1
     fi
 
