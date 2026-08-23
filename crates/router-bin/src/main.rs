@@ -113,7 +113,11 @@ fn main() -> anyhow::Result<()> {
     ));
 
     // Spawn one signal collector task per backend. Hold handles alive for process lifetime.
-    let _signal_handles = spawn_collectors(state.clone(), signal_cfg);
+
+    let _signal_handles = {
+        let _enter = runtime.enter();
+        spawn_collectors(state.clone(), signal_cfg)
+    };
 
     runtime.block_on(router_proxy::listener::serve(&config.listener_bind, state))?;
 
