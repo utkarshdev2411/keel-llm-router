@@ -84,6 +84,29 @@ pub fn metric_value(text: &str, name: &str) -> Option<f64> {
     None
 }
 
+/// Extract a counter that may or may not carry the Prometheus `_total` suffix.
+///
+/// The two backends this router runs against disagree on the name. Real vLLM
+/// v0.26.0, verified on the wire, exports `vllm:num_preemptions_total` and
+/// `vllm:prefix_cache_hits_total`. `llm-d-inference-sim` exports the bare
+/// `vllm:prefix_cache_hits` and omits preemptions entirely.
+///
+/// Searching for only one spelling silently yields `None` against the other
+/// backend, which is indistinguishable from the metric being genuinely absent.
+/// That is the exact confusion this parser exists to prevent, and for
+/// preemptions it is the difference between "the gate held" and "we never
+/// looked".
+///
+/// Tries the bare name first, then `<base>_total`. Both lookups go through
+/// `metric_value`, which anchors on `{` or whitespace, so the sibling
+/// `<base>_created` -- whose value is a unix timestamp, not a count -- can
+/// never be matched by accident.
+///
+/// Returns `None` when neither spelling is present. NEVER `Some(0.0)`.
+pub fn counter_value(text: &str, base: &str) -> Option<f64> {
+    metric_value(text, base).or_else(|| metric_value(text, &format!("{base}_total")))
+}
+
 /// Extract one label's value from an info-style metric where the data
 /// lives in labels (e.g., vllm:cache_config_info{block_size="16",num_gpu_blocks="512"} 1).
 /// The metric value itself is always 1 and meaningless.
@@ -154,8 +177,8 @@ pub fn parse_reported(
     prev: Option<&CounterSample>,
 ) -> (ReportedLoad, CounterSample) {
     // Extract current counter values
-    let current_hits = metric_value(text, "vllm:prefix_cache_hits");
-    let current_queries = metric_value(text, "vllm:prefix_cache_queries");
+    let current_hits = counter_value(text, "vllm:prefix_cache_hits");
+    let current_queries = counter_value(text, "vllm:prefix_cache_queries");
 
     // Compute windowed prefix hit rate
     let prefix_hit_rate = if let (Some(prev_sample), Some(cur_hits), Some(cur_queries)) =
@@ -185,7 +208,7 @@ pub fn parse_reported(
     let kv_usage_perc = metric_value(text, "vllm:kv_cache_usage_perc").map(|v| v as f32);
     let num_running = metric_value(text, "vllm:num_requests_running").map(|v| v as u32);
     let num_waiting = metric_value(text, "vllm:num_requests_waiting").map(|v| v as u32);
-    let preemptions = metric_value(text, "vllm:num_preemptions").map(|v| v as u64);
+    let preemptions = counter_value(text, "vllm:num_preemptions").map(|v| v as u64);
 
     let load = ReportedLoad {
         observed_at: now,
