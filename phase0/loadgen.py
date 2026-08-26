@@ -148,52 +148,65 @@ async def send_request(client, backend, req, req_id, sched_s, results, state,
     try:
         async with client.stream("POST", f"{backend}/v1/chat/completions",
                                  json=payload, timeout=300.0) as r:
-            async for line in r.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                d = line[5:].strip()
-                if d == "[DONE]":
-                    break
-                try:
-                    o = json.loads(d)
-                except json.JSONDecodeError:
-                    continue
-                # This simulator reports KV-exhaustion as HTTP 200 with an error
-                # object embedded in the SSE stream, not as an HTTP error status
-                # (that only happens non-streaming). Missing this made every
-                # KV rejection look like a silent 0-token success: err% read 0.0%
-                # while 61% of requests at rate 24 were actually being rejected.
-                if "error" in o:
-                    err = o["error"].get("message", str(o["error"]))
-                    break
-                ch = o.get("choices") or []
-                if not ch:
-                    continue
-                txt = ch[0].get("delta", {}).get("content", "")
-                if not txt:
-                    continue
-                if first_tok is None:
-                    first_tok = time.monotonic()
-                c += 1
+            # Real vLLM signals failure with an HTTP error STATUS (context-length
+            # overflow, malformed request), not with an SSE error frame. That body
+            # contains no `data:` lines at all, so the stream loop below falls
+            # straight through and records a 0-token SUCCESS. Measured against vLLM
+            # v0.26.0: 14 of 80 requests returned 400 and every one was logged as ok,
+            # while the router independently counted all 14 as errors. This is the
+            # same failure the SSE-error check below was written to stop, arriving
+            # through the other door.
+            if r.status_code != 200:
+                raw = await r.aread()
+                body = raw[:200].decode("utf-8", "replace")
+                err = f"HTTP {r.status_code}: {body}"
+            else:
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    d = line[5:].strip()
+                    if d == "[DONE]":
+                        break
+                    try:
+                        o = json.loads(d)
+                    except json.JSONDecodeError:
+                        continue
+                    # This simulator reports KV-exhaustion as HTTP 200 with an error
+                    # object embedded in the SSE stream, not as an HTTP error status
+                    # (that only happens non-streaming). Missing this made every
+                    # KV rejection look like a silent 0-token success: err% read 0.0%
+                    # while 61% of requests at rate 24 were actually being rejected.
+                    if "error" in o:
+                        err = o["error"].get("message", str(o["error"]))
+                        break
+                    ch = o.get("choices") or []
+                    if not ch:
+                        continue
+                    txt = ch[0].get("delta", {}).get("content", "")
+                    if not txt:
+                        continue
+                    if first_tok is None:
+                        first_tok = time.monotonic()
+                    c += 1
 
-                # Output ran past the estimate: extend it and re-charge both
-                # accounting channels. Under-estimating output length is what
-                # causes preemption, so this must never lag reality.
-                # Strictly greater: under output-model=echo, o_hat equals the
-                # prompt length exactly, so c reaches it on the final token and
-                # `>=` would fire a spurious recharge on every request.
-                if c > o_hat:
-                    o_hat += 50
-                    # Under kv_model=prompt_only this is a no-op delta of 0, which
-                    # is correct: the backend's KV does not grow with output there.
-                    new_kv = kv_for(p, o_hat, state["kv_model"])
-                    state["kv_proj"][backend] += (new_kv - kv_held)
-                    kv_held = new_kv
+                    # Output ran past the estimate: extend it and re-charge both
+                    # accounting channels. Under-estimating output length is what
+                    # causes preemption, so this must never lag reality.
+                    # Strictly greater: under output-model=echo, o_hat equals the
+                    # prompt length exactly, so c reaches it on the final token and
+                    # `>=` would fire a spurious recharge on every request.
+                    if c > o_hat:
+                        o_hat += 50
+                        # Under kv_model=prompt_only this is a no-op delta of 0, which
+                        # is correct: the backend's KV does not grow with output there.
+                        new_kv = kv_for(p, o_hat, state["kv_model"])
+                        state["kv_proj"][backend] += (new_kv - kv_held)
+                        kv_held = new_kv
 
-                if policy.startswith("kvts"):
-                    new = kvts_remaining(p, 0, c, o_hat)
-                    state["W"][backend] += (new - charged)
-                    charged = new
+                    if policy.startswith("kvts"):
+                        new = kvts_remaining(p, 0, c, o_hat)
+                        state["W"][backend] += (new - charged)
+                        charged = new
     except Exception as e:
         err = str(e)
     finally:
