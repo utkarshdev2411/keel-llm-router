@@ -1,0 +1,46 @@
+[listener]
+bind = "0.0.0.0:8080"
+admin_bind = "127.0.0.1:9090"
+
+[routing]
+strategy = "pressure"
+# Real vLLM grows KV during decode; the simulator allocates prompt blocks at
+# admission and never grows them. The two differ by roughly 2x.
+kv_model = "prompt_plus_output"
+theta = 0.55
+penalty = 10.0
+# Calibrated against real vLLM's subword tokenizer, not guessed: starting from
+# the 4.0 placeholder the measured mean prompt-token ratio was 0.463, and
+# 4.0 * 0.463 = 1.85 landed the median ratio at 1.008 on the rerun.
+token_counter = "chars_per_token"
+chars_per_token = 1.85
+
+[admission]
+sigma = 0.95
+
+[observability]
+occupancy_sample_interval_ms = 100
+
+[signal]
+enabled = true
+scrape_interval_ms = 2000
+scrape_timeout_ms = 500
+max_signal_age_ms = 5000
+drift_warn_ratio = 1.05
+validate_capacity_at_startup = true
+
+# Capacity is PINNED via --num-gpu-blocks-override in restart_real.sh, because
+# vLLM's profiled block count is not reproducible across restarts. Both
+# backends are deliberately identical so the only variable between arms is the
+# routing strategy.
+[[backends]]
+url = "http://127.0.0.1:8000"
+model = "test-model"
+kv_tokens = 8192      # 512 blocks * block_size 16
+max_num_seqs = 32
+
+[[backends]]
+url = "http://127.0.0.1:8001"
+model = "test-model"
+kv_tokens = 8192      # 512 blocks * block_size 16
+max_num_seqs = 32
